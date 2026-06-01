@@ -10,14 +10,15 @@ final class ActionOverlayController: NSObject {
     private let deleteButton = NSButton()
     private let buttonStack = NSStackView()
     private let onDelete: (ScreenshotFile) -> Void
-    private let onOpen: (ScreenshotFile) -> Void
+    private let onOpen: (ScreenshotFile, Bool) -> Void
     private var currentScreenshot: ScreenshotFile?
+    private var currentIsWindowCapture = false
     private var autoHideWorkItem: DispatchWorkItem?
     private var isVisible = false
 
     init(
         onDelete: @escaping (ScreenshotFile) -> Void = { _ in },
-        onOpen: @escaping (ScreenshotFile) -> Void = { _ in }
+        onOpen: @escaping (ScreenshotFile, Bool) -> Void = { _, _ in }
     ) {
         self.onDelete = onDelete
         self.onOpen = onOpen
@@ -34,8 +35,9 @@ final class ActionOverlayController: NSObject {
         configureInteraction()
     }
 
-    func present(for screenshot: ScreenshotFile, previewImage: NSImage? = nil, on screen: NSScreen? = nil) {
+    func present(for screenshot: ScreenshotFile, previewImage: NSImage? = nil, on screen: NSScreen? = nil, isWindowCapture: Bool = false) {
         currentScreenshot = screenshot
+        currentIsWindowCapture = isWindowCapture
         previewImageView.image = previewImage ?? NSImage(contentsOf: screenshot.url)
         previewImageView.fileURL = screenshot.url
         deleteButton.isEnabled = FileManager.default.fileExists(atPath: screenshot.url.path)
@@ -249,7 +251,7 @@ final class ActionOverlayController: NSObject {
             return
         }
 
-        onOpen(screenshot)
+        onOpen(screenshot, currentIsWindowCapture)
     }
 }
 

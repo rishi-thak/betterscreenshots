@@ -8,6 +8,7 @@ struct CaptureResult {
     let screenshot: ScreenshotFile
     let image: NSImage
     let anchorScreen: NSScreen?
+    let isWindowCapture: Bool
 }
 
 final class CaptureManager {
@@ -44,35 +45,57 @@ final class CaptureManager {
 
         let anchorPoint = NSEvent.mouseLocation
         let anchorScreen = screens.first(where: { $0.frame.contains(anchorPoint) })
-        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen)
+        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen, isWindowCapture: false)
     }
 
     func captureRegion(_ rect: CGRect) -> CaptureResult? {
         let normalizedRect = rect.standardized.integral
-        guard normalizedRect.width >= 2, normalizedRect.height >= 2 else {
-            return nil
-        }
-
-        return capture(rect: normalizedRect, anchorPoint: CGPoint(x: normalizedRect.midX, y: normalizedRect.midY))
+        guard normalizedRect.width >= 2, normalizedRect.height >= 2 else { return nil }
+        return capture(rect: normalizedRect, anchorPoint: CGPoint(x: normalizedRect.midX, y: normalizedRect.midY), isWindowCapture: false)
     }
 
-    private func capture(rect: CGRect, anchorPoint: CGPoint) -> CaptureResult? {
+    func captureWindow(windowID: CGWindowID, rect: CGRect) -> CaptureResult? {
+        guard let cgImage = CGWindowListCreateImage(
+            CGRect.null,
+            .optionIncludingWindow,
+            windowID,
+            [.bestResolution, .boundsIgnoreFraming]
+        ) else { return nil }
+
+        let masked = roundedMask(cgImage, radius: 12)
+        let image = NSImage(cgImage: masked ?? cgImage, size: NSSize(width: (masked ?? cgImage).width, height: (masked ?? cgImage).height))
+        guard let screenshot = save(cgImage: masked ?? cgImage) else { return nil }
+
+        let anchorScreen = NSScreen.screens.first(where: { $0.frame.contains(CGPoint(x: rect.midX, y: rect.midY)) })
+        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen, isWindowCapture: true)
+    }
+
+    private func roundedMask(_ image: CGImage, radius: CGFloat) -> CGImage? {
+        let w = image.width, h = image.height
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        let rect = CGRect(x: 0, y: 0, width: w, height: h)
+        let path = CGPath(roundedRect: rect, cornerWidth: radius * 2, cornerHeight: radius * 2, transform: nil)
+        ctx.addPath(path)
+        ctx.clip()
+        ctx.draw(image, in: rect)
+        return ctx.makeImage()
+    }
+
+    private func capture(rect: CGRect, anchorPoint: CGPoint, isWindowCapture: Bool) -> CaptureResult? {
         guard let cgImage = CGWindowListCreateImage(
             rect,
             .optionOnScreenOnly,
             kCGNullWindowID,
             [.bestResolution, .boundsIgnoreFraming]
-        ) else {
-            return nil
-        }
+        ) else { return nil }
 
         let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        guard let screenshot = save(cgImage: cgImage) else {
-            return nil
-        }
+        guard let screenshot = save(cgImage: cgImage) else { return nil }
 
         let anchorScreen = NSScreen.screens.first(where: { $0.frame.contains(anchorPoint) })
-        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen)
+        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen, isWindowCapture: isWindowCapture)
     }
 
     private func makeCompositeImage(for screens: [NSScreen], canvasRect: CGRect) -> CGImage? {

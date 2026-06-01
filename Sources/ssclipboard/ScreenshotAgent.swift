@@ -19,8 +19,8 @@ final class ScreenshotAgent {
         onDelete: { [weak self] screenshot in
             self?.handleDeletedScreenshot(screenshot)
         },
-        onOpen: { [weak self] screenshot in
-            self?.openScreenshot(screenshot)
+        onOpen: { [weak self] screenshot, isWindowCapture in
+            self?.openScreenshot(screenshot, isWindowCapture: isWindowCapture)
         }
     )
     private lazy var hotKeyManager = HotKeyManager(
@@ -61,27 +61,32 @@ final class ScreenshotAgent {
             return
         }
 
-        regionSelectionController.beginSelection { [weak self] rect in
-            guard let self, let rect,
-                  let result = self.captureManager.captureRegion(rect) else {
-                return
+        regionSelectionController.beginSelection { [weak self] result in
+            guard let self, let result else { return }
+
+            let captureResult: CaptureResult?
+            if let windowID = result.windowID {
+                captureResult = self.captureManager.captureWindow(windowID: windowID, rect: result.rect)
+            } else {
+                captureResult = self.captureManager.captureRegion(result.rect)
             }
 
-            self.handleCapture(result)
+            guard let captureResult else { return }
+            self.handleCapture(captureResult)
         }
     }
 
     private func handleCapture(_ result: CaptureResult) {
         _ = clipboardWriter.copyImage(result.image)
-        overlayController.present(for: result.screenshot, previewImage: result.image, on: result.anchorScreen)
+        overlayController.present(for: result.screenshot, previewImage: result.image, on: result.anchorScreen, isWindowCapture: result.isWindowCapture)
     }
 
     private func handleDeletedScreenshot(_ screenshot: ScreenshotFile) {
         _ = screenshot
     }
 
-    private func openScreenshot(_ screenshot: ScreenshotFile) {
-        viewerController.present(screenshot: screenshot)
+    private func openScreenshot(_ screenshot: ScreenshotFile, isWindowCapture: Bool) {
+        viewerController.present(screenshot: screenshot, isWindowCapture: isWindowCapture)
     }
 
     private func handlePermissionState(_ state: ScreenCapturePermissionManager.State) {

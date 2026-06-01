@@ -1,5 +1,7 @@
 import AppKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 @MainActor
 final class ScreenshotViewerController: NSObject {
@@ -22,11 +24,17 @@ final class ScreenshotViewerController: NSObject {
     private let deleteButton = NSButton()
     private let zoomOutButton = NSButton()
     private let zoomInButton = NSButton()
+    private let backgroundButton = NSButton()
 
     private var currentScreenshot: ScreenshotFile?
     private var currentImage: NSImage?
+    private var isWindowCapture = false
     private var zoomScale: CGFloat = 1
     private let imageInset: CGFloat = 24
+
+    // Background editor
+    private var backgroundEditorView: BackgroundEditorView?
+    private var scrollBottomConstraint: NSLayoutConstraint?
 
     init(clipboardWriter: ClipboardWriter, onDelete: @escaping (ScreenshotFile) -> Void) {
         self.clipboardWriter = clipboardWriter
@@ -50,20 +58,31 @@ final class ScreenshotViewerController: NSObject {
     }
 
     @objc private func windowDidResignKey() {
+        // Don't close if focus moved to an auxiliary panel (e.g. color picker)
+        if let key = NSApp.keyWindow, key is NSPanel { return }
         window.orderOut(nil)
     }
 
-    func present(screenshot: ScreenshotFile) {
+    func present(screenshot: ScreenshotFile, isWindowCapture: Bool = false) {
         currentScreenshot = screenshot
         currentImage = NSImage(contentsOf: screenshot.url)
+        self.isWindowCapture = isWindowCapture
         imageView.image = currentImage
         titleLabel.stringValue = screenshot.url.lastPathComponent
         deleteButton.isEnabled = FileManager.default.fileExists(atPath: screenshot.url.path)
-        setZoomScale(1)
+        backgroundButton.isEnabled = isWindowCapture
+        backgroundButton.alphaValue = isWindowCapture ? 1 : 0.35
+        hideBackgroundEditor()
 
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+
+        // Defer so scroll view has its final size before computing fit
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let img = self.currentImage else { return }
+            self.setZoomScale(self.fitZoomScale(for: img))
+        }
     }
 
     private func configureWindow() {
@@ -104,26 +123,21 @@ final class ScreenshotViewerController: NSObject {
         imageScrollView.hasHorizontalScroller = true
         imageScrollView.borderType = .noBorder
 
-        imageView.translatesAutoresizingMaskIntoConstraints = false
+        // Frame-based — sized explicitly in setZoomScale
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.wantsLayer = true
         imageView.layer?.cornerRadius = 10
         imageView.layer?.masksToBounds = true
 
-        documentView.translatesAutoresizingMaskIntoConstraints = false
         documentView.addSubview(imageView)
         imageScrollView.documentView = documentView
-
-        NSLayoutConstraint.activate([
-            imageView.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: imageInset),
-            imageView.topAnchor.constraint(equalTo: documentView.topAnchor, constant: imageInset)
-        ])
 
         configureToolbarButton(closeButton, symbol: "xmark", toolTip: "Close", action: #selector(closeViewer))
         configureToolbarButton(copyButton, symbol: "doc.on.doc", toolTip: "Copy", action: #selector(copyScreenshot))
         configureToolbarButton(shareButton, symbol: "square.and.arrow.up", toolTip: "Share", action: #selector(shareScreenshot(_:)))
         configureToolbarButton(revealButton, symbol: "folder", toolTip: "Show in Finder", action: #selector(revealInFinder))
         configureToolbarButton(deleteButton, symbol: "trash", toolTip: "Delete", action: #selector(deleteScreenshot))
+        configureToolbarButton(backgroundButton, symbol: "photo.artframe", toolTip: "Add Background", action: #selector(toggleBackgroundEditor))
         configureToolbarButton(zoomOutButton, symbol: "minus", toolTip: "Zoom Out", action: #selector(zoomOut))
         configureToolbarButton(zoomInButton, symbol: "plus", toolTip: "Zoom In", action: #selector(zoomIn))
 
@@ -135,7 +149,7 @@ final class ScreenshotViewerController: NSObject {
         rootView.addSubview(toolbarView)
         rootView.addSubview(imageScrollView)
 
-        let leftStack = NSStackView(views: [closeButton, copyButton, shareButton, revealButton, deleteButton])
+        let leftStack = NSStackView(views: [closeButton, copyButton, shareButton, revealButton, deleteButton, backgroundButton])
         leftStack.translatesAutoresizingMaskIntoConstraints = false
         leftStack.orientation = .horizontal
         leftStack.spacing = 8
@@ -154,13 +168,12 @@ final class ScreenshotViewerController: NSObject {
         NSLayoutConstraint.activate([
             toolbarView.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
             toolbarView.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
-            toolbarView.topAnchor.constraint(equalTo: rootView.topAnchor),
+            toolbarView.bottomAnchor.constraint(equalTo: rootView.bottomAnchor),
             toolbarView.heightAnchor.constraint(equalToConstant: 58),
 
             imageScrollView.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
             imageScrollView.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
-            imageScrollView.topAnchor.constraint(equalTo: toolbarView.bottomAnchor),
-            imageScrollView.bottomAnchor.constraint(equalTo: rootView.bottomAnchor),
+            imageScrollView.topAnchor.constraint(equalTo: rootView.topAnchor),
 
             leftStack.leadingAnchor.constraint(equalTo: toolbarView.leadingAnchor, constant: 16),
             leftStack.centerYAnchor.constraint(equalTo: toolbarView.centerYAnchor),
@@ -175,6 +188,10 @@ final class ScreenshotViewerController: NSObject {
 
             zoomLabel.widthAnchor.constraint(equalToConstant: 52)
         ])
+
+        let scrollBottom = imageScrollView.bottomAnchor.constraint(equalTo: toolbarView.topAnchor)
+        scrollBottom.isActive = true
+        scrollBottomConstraint = scrollBottom
     }
 
     private func configureToolbarButton(_ button: NSButton, symbol: String, toolTip: String, action: Selector) {
@@ -190,11 +207,20 @@ final class ScreenshotViewerController: NSObject {
         button.toolTip = toolTip
         button.target = self
         button.action = action
-
         NSLayoutConstraint.activate([
             button.widthAnchor.constraint(equalToConstant: 32),
             button.heightAnchor.constraint(equalToConstant: 32)
         ])
+    }
+
+    private func fitZoomScale(for image: NSImage) -> CGFloat {
+        let viewSize = imageScrollView.bounds.size
+        guard viewSize.width > 0, viewSize.height > 0 else { return 1 }
+        let availW = viewSize.width - imageInset * 2
+        let availH = viewSize.height - imageInset * 2
+        let scaleW = availW / image.size.width
+        let scaleH = availH / image.size.height
+        return min(min(scaleW, scaleH), 1)  // never upscale beyond 100%
     }
 
     private func setZoomScale(_ newValue: CGFloat) {
@@ -202,76 +228,448 @@ final class ScreenshotViewerController: NSObject {
         zoomScale = clamped
         zoomLabel.stringValue = "\(Int(clamped * 100))%"
 
-        guard let image = currentImage else {
-            return
-        }
+        guard let image = currentImage else { return }
 
-        let baseSize = image.size
-        imageView.frame = NSRect(
-            origin: .zero,
-            size: NSSize(width: baseSize.width * clamped, height: baseSize.height * clamped)
-        )
-        documentView.frame = NSRect(
-            x: 0,
-            y: 0,
-            width: imageView.frame.width + (imageInset * 2),
-            height: imageView.frame.height + (imageInset * 2)
-        )
+        let scaledSize = NSSize(width: image.size.width * clamped, height: image.size.height * clamped)
+        let viewSize = imageScrollView.contentSize
+
+        // Document is at least as large as the viewport so the image stays centered
+        let docW = max(scaledSize.width + imageInset * 2, viewSize.width)
+        let docH = max(scaledSize.height + imageInset * 2, viewSize.height)
+
+        let imgX = (docW - scaledSize.width) / 2
+        let imgY = (docH - scaledSize.height) / 2
+
+        imageView.frame = NSRect(origin: NSPoint(x: imgX, y: imgY), size: scaledSize)
+        documentView.frame = NSRect(origin: .zero, size: NSSize(width: docW, height: docH))
+        imageScrollView.documentView = documentView
     }
 
-    @objc
-    private func closeViewer() {
-        window.orderOut(nil)
-    }
+    // MARK: - Background editor
 
-    @objc
-    private func copyScreenshot() {
-        if let image = currentImage {
-            _ = clipboardWriter.copyImage(image)
+    @objc private func toggleBackgroundEditor() {
+        if backgroundEditorView != nil {
+            hideBackgroundEditor()
+        } else {
+            showBackgroundEditor()
         }
     }
 
-    @objc
-    private func shareScreenshot(_ sender: NSButton) {
-        guard let screenshot = currentScreenshot else {
-            return
+    private func showBackgroundEditor() {
+        guard backgroundEditorView == nil, let image = currentImage else { return }
+
+        let editor = BackgroundEditorView(windowImage: image)
+        editor.translatesAutoresizingMaskIntoConstraints = false
+        editor.onSave = { [weak self] composited in
+            self?.saveComposited(composited)
+        }
+        editor.onCancel = { [weak self] in
+            self?.hideBackgroundEditor()
+        }
+        editor.onPreview = { [weak self] composited in
+            guard let self else { return }
+            self.imageView.image = composited
+            self.setZoomScale(self.fitZoomScale(for: composited))
         }
 
+        rootView.addSubview(editor)
+        NSLayoutConstraint.activate([
+            editor.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
+            editor.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
+            editor.bottomAnchor.constraint(equalTo: toolbarView.topAnchor),
+            editor.heightAnchor.constraint(equalToConstant: 160)
+        ])
+
+        scrollBottomConstraint?.isActive = false
+        let newBottom = imageScrollView.bottomAnchor.constraint(equalTo: editor.topAnchor)
+        newBottom.isActive = true
+        scrollBottomConstraint = newBottom
+
+        backgroundEditorView = editor
+    }
+
+    private func hideBackgroundEditor() {
+        backgroundEditorView?.removeFromSuperview()
+        backgroundEditorView = nil
+        imageView.image = currentImage
+
+        scrollBottomConstraint?.isActive = false
+        let newBottom = imageScrollView.bottomAnchor.constraint(equalTo: toolbarView.topAnchor)
+        newBottom.isActive = true
+        scrollBottomConstraint = newBottom
+
+        setZoomScale(zoomScale)
+    }
+
+    private func saveComposited(_ image: NSImage) {
+        guard let screenshot = currentScreenshot else { return }
+
+        // Write PNG to disk, overwriting original
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else { return }
+
+        try? png.write(to: screenshot.url)
+
+        // Update state
+        currentImage = image
+        imageView.image = image
+        _ = clipboardWriter.copyImage(image)
+        hideBackgroundEditor()
+        setZoomScale(fitZoomScale(for: image))
+    }
+
+    @objc private func closeViewer() { window.orderOut(nil) }
+
+    @objc private func copyScreenshot() {
+        if let image = currentImage { _ = clipboardWriter.copyImage(image) }
+    }
+
+    @objc private func shareScreenshot(_ sender: NSButton) {
+        guard let screenshot = currentScreenshot else { return }
         let picker = NSSharingServicePicker(items: [screenshot.url])
         picker.show(relativeTo: sender.bounds, of: sender, preferredEdge: .maxY)
     }
 
-    @objc
-    private func revealInFinder() {
-        guard let screenshot = currentScreenshot else {
-            return
-        }
-
+    @objc private func revealInFinder() {
+        guard let screenshot = currentScreenshot else { return }
         NSWorkspace.shared.activateFileViewerSelecting([screenshot.url])
     }
 
-    @objc
-    private func deleteScreenshot() {
-        guard let screenshot = currentScreenshot else {
-            return
-        }
-
+    @objc private func deleteScreenshot() {
+        guard let screenshot = currentScreenshot else { return }
         do {
             try FileManager.default.removeItem(at: screenshot.url)
             onDelete(screenshot)
             window.orderOut(nil)
-        } catch {
-            NSSound.beep()
+        } catch { NSSound.beep() }
+    }
+
+    @objc private func zoomOut() { setZoomScale(zoomScale - 0.15) }
+    @objc private func zoomIn() { setZoomScale(zoomScale + 0.15) }
+}
+
+// MARK: - Background Editor View
+
+@MainActor
+private final class BackgroundEditorView: NSView {
+    var onSave: ((NSImage) -> Void)?
+    var onCancel: (() -> Void)?
+    var onPreview: ((NSImage) -> Void)?
+
+    private let windowImage: NSImage
+    private var selectedBackground: Background = .gradient(0)
+    private var selectedRatio: AspectRatio = .free
+    private var padding: CGFloat = 40
+
+    enum AspectRatio: String, CaseIterable {
+        case free = "Free", square = "1:1", fourThree = "4:3", sixteenNine = "16:9", threeTwo = "3:2"
+        var ratio: CGFloat? {
+            switch self {
+            case .free: return nil
+            case .square: return 1
+            case .fourThree: return 4/3
+            case .sixteenNine: return 16/9
+            case .threeTwo: return 3/2
+            }
         }
     }
 
-    @objc
-    private func zoomOut() {
-        setZoomScale(zoomScale - 0.15)
+    enum Background {
+        case gradient(Int)
+        case solid(NSColor)
     }
 
-    @objc
-    private func zoomIn() {
-        setZoomScale(zoomScale + 0.15)
+    static let gradients: [(NSColor, NSColor)] = [
+        (NSColor(red: 0.40, green: 0.20, blue: 0.90, alpha: 1), NSColor(red: 0.10, green: 0.60, blue: 1.00, alpha: 1)),
+        (NSColor(red: 1.00, green: 0.30, blue: 0.50, alpha: 1), NSColor(red: 1.00, green: 0.70, blue: 0.20, alpha: 1)),
+        (NSColor(red: 0.10, green: 0.80, blue: 0.60, alpha: 1), NSColor(red: 0.10, green: 0.50, blue: 0.90, alpha: 1)),
+        (NSColor(red: 0.95, green: 0.40, blue: 0.10, alpha: 1), NSColor(red: 1.00, green: 0.80, blue: 0.10, alpha: 1)),
+        (NSColor(red: 0.20, green: 0.20, blue: 0.25, alpha: 1), NSColor(red: 0.40, green: 0.40, blue: 0.50, alpha: 1)),
+        (NSColor(red: 0.80, green: 0.20, blue: 0.80, alpha: 1), NSColor(red: 0.40, green: 0.10, blue: 0.60, alpha: 1)),
+    ]
+
+    init(windowImage: NSImage) {
+        self.windowImage = windowImage
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 0.97).cgColor
+        layer?.borderColor = NSColor(calibratedWhite: 0.25, alpha: 1).cgColor
+        layer?.borderWidth = 1
+        buildUI()
+        updatePreview()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func buildUI() {
+        // Gradient swatches
+        let swatchStack = NSStackView()
+        swatchStack.translatesAutoresizingMaskIntoConstraints = false
+        swatchStack.orientation = .horizontal
+        swatchStack.spacing = 8
+
+        for (i, grad) in Self.gradients.enumerated() {
+            let swatch = GradientSwatchButton(from: grad.0, to: grad.1, tag: i)
+            swatch.target = self
+            swatch.action = #selector(selectGradient(_:))
+            swatchStack.addArrangedSubview(swatch)
+            NSLayoutConstraint.activate([swatch.widthAnchor.constraint(equalToConstant: 32), swatch.heightAnchor.constraint(equalToConstant: 32)])
+        }
+
+        // Color wheel button
+        let colorWheel = ColorWheelButton()
+        colorWheel.translatesAutoresizingMaskIntoConstraints = false
+        colorWheel.onColorPicked = { [weak self] color in
+            self?.selectedBackground = .solid(color)
+            self?.updatePreview()
+        }
+        NSLayoutConstraint.activate([colorWheel.widthAnchor.constraint(equalToConstant: 32), colorWheel.heightAnchor.constraint(equalToConstant: 32)])
+        swatchStack.addArrangedSubview(colorWheel)
+
+        // Aspect ratio pills
+        let ratioStack = NSStackView()
+        ratioStack.translatesAutoresizingMaskIntoConstraints = false
+        ratioStack.orientation = .horizontal
+        ratioStack.spacing = 6
+
+        for ratio in AspectRatio.allCases {
+            let btn = NSButton()
+            btn.translatesAutoresizingMaskIntoConstraints = false
+            btn.title = ratio.rawValue
+            btn.font = .systemFont(ofSize: 11, weight: .medium)
+            btn.bezelStyle = .regularSquare
+            btn.isBordered = false
+            btn.wantsLayer = true
+            btn.layer?.cornerRadius = 6
+            btn.layer?.backgroundColor = (ratio == selectedRatio)
+                ? NSColor.systemBlue.cgColor
+                : NSColor(calibratedWhite: 0.25, alpha: 1).cgColor
+            btn.contentTintColor = .white
+            btn.target = self
+            btn.action = #selector(selectRatio(_:))
+            btn.identifier = NSUserInterfaceItemIdentifier(ratio.rawValue)
+            NSLayoutConstraint.activate([btn.heightAnchor.constraint(equalToConstant: 26)])
+            ratioStack.addArrangedSubview(btn)
+        }
+
+        // Padding slider
+        let paddingLabel = NSTextField(labelWithString: "Padding")
+        paddingLabel.translatesAutoresizingMaskIntoConstraints = false
+        paddingLabel.font = .systemFont(ofSize: 11)
+        paddingLabel.textColor = NSColor(calibratedWhite: 0.7, alpha: 1)
+
+        let slider = NSSlider(value: Double(padding), minValue: 0, maxValue: 120, target: self, action: #selector(paddingChanged(_:)))
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.controlSize = .small
+        NSLayoutConstraint.activate([slider.widthAnchor.constraint(equalToConstant: 100)])
+
+        let paddingRow = NSStackView(views: [paddingLabel, slider])
+        paddingRow.translatesAutoresizingMaskIntoConstraints = false
+        paddingRow.orientation = .horizontal
+        paddingRow.spacing = 8
+        paddingRow.alignment = .centerY
+
+        // Save / Cancel
+        let saveButton = NSButton()
+        saveButton.translatesAutoresizingMaskIntoConstraints = false
+        saveButton.title = "Save"
+        saveButton.bezelStyle = .regularSquare
+        saveButton.isBordered = false
+        saveButton.wantsLayer = true
+        saveButton.layer?.cornerRadius = 8
+        saveButton.layer?.backgroundColor = NSColor.systemBlue.cgColor
+        saveButton.contentTintColor = .white
+        saveButton.font = .systemFont(ofSize: 13, weight: .semibold)
+        saveButton.target = self
+        saveButton.action = #selector(save)
+        NSLayoutConstraint.activate([saveButton.widthAnchor.constraint(equalToConstant: 72), saveButton.heightAnchor.constraint(equalToConstant: 32)])
+
+        let cancelButton = NSButton()
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        cancelButton.title = "Cancel"
+        cancelButton.bezelStyle = .regularSquare
+        cancelButton.isBordered = false
+        cancelButton.wantsLayer = true
+        cancelButton.layer?.cornerRadius = 8
+        cancelButton.layer?.backgroundColor = NSColor(calibratedWhite: 0.25, alpha: 1).cgColor
+        cancelButton.contentTintColor = .white
+        cancelButton.font = .systemFont(ofSize: 13)
+        cancelButton.target = self
+        cancelButton.action = #selector(cancel)
+        NSLayoutConstraint.activate([cancelButton.widthAnchor.constraint(equalToConstant: 72), cancelButton.heightAnchor.constraint(equalToConstant: 32)])
+
+        let actionStack = NSStackView(views: [cancelButton, saveButton])
+        actionStack.translatesAutoresizingMaskIntoConstraints = false
+        actionStack.orientation = .horizontal
+        actionStack.spacing = 8
+
+        // Top row: swatches + ratio + padding
+        let topRow = NSStackView(views: [swatchStack, NSView(), ratioStack, paddingRow])
+        topRow.translatesAutoresizingMaskIntoConstraints = false
+        topRow.orientation = .horizontal
+        topRow.spacing = 16
+        topRow.alignment = .centerY
+        (topRow.views[1] as! NSView).setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let mainStack = NSStackView(views: [topRow, actionStack])
+        mainStack.translatesAutoresizingMaskIntoConstraints = false
+        mainStack.orientation = .vertical
+        mainStack.spacing = 12
+        mainStack.alignment = .leading
+        mainStack.edgeInsets = NSEdgeInsets(top: 16, left: 20, bottom: 16, right: 20)
+
+        addSubview(mainStack)
+        NSLayoutConstraint.activate([
+            mainStack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            mainStack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            mainStack.topAnchor.constraint(equalTo: topAnchor),
+            mainStack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    @objc private func selectGradient(_ sender: NSButton) {
+        selectedBackground = .gradient(sender.tag)
+        updatePreview()
+    }
+
+    @objc private func selectRatio(_ sender: NSButton) {
+        guard let id = sender.identifier?.rawValue,
+              let ratio = AspectRatio(rawValue: id) else { return }
+        selectedRatio = ratio
+        // Update pill highlight
+        for view in sender.superview?.subviews ?? [] {
+            guard let btn = view as? NSButton else { continue }
+            btn.layer?.backgroundColor = (btn.identifier?.rawValue == id)
+                ? NSColor.systemBlue.cgColor
+                : NSColor(calibratedWhite: 0.25, alpha: 1).cgColor
+        }
+        updatePreview()
+    }
+
+    @objc private func paddingChanged(_ sender: NSSlider) {
+        padding = CGFloat(sender.doubleValue)
+        updatePreview()
+    }
+
+    @objc private func save() {
+        onSave?(composite())
+    }
+
+    @objc private func cancel() {
+        onCancel?()
+    }
+
+    private func updatePreview() {
+        onPreview?(composite())
+    }
+
+    func composite() -> NSImage {
+        let imgSize = windowImage.size
+        let pad = padding
+
+        // Determine canvas size
+        let contentW = imgSize.width + pad * 2
+        let contentH = imgSize.height + pad * 2
+
+        let canvasSize: CGSize
+        if let ratio = selectedRatio.ratio {
+            let fromW = CGSize(width: max(contentW, contentH * ratio), height: max(contentW, contentH * ratio) / ratio)
+            let fromH = CGSize(width: max(contentH * ratio, contentW), height: max(contentH, contentW / ratio))
+            // Pick whichever fits the content
+            canvasSize = (fromW.width >= contentW && fromW.height >= contentH) ? fromW : fromH
+        } else {
+            canvasSize = CGSize(width: contentW, height: contentH)
+        }
+
+        let result = NSImage(size: canvasSize)
+        result.lockFocus()
+
+        let ctx = NSGraphicsContext.current!.cgContext
+        let canvasRect = CGRect(origin: .zero, size: canvasSize)
+
+        // Draw background
+        switch selectedBackground {
+        case .gradient(let idx):
+            let (c1, c2) = Self.gradients[idx]
+            let gradient = NSGradient(starting: c1, ending: c2)!
+            gradient.draw(in: canvasRect, angle: 135)
+        case .solid(let color):
+            color.setFill()
+            canvasRect.fill()
+        }
+
+        // Draw window image centered with rounded corners
+        let imgX = (canvasSize.width - imgSize.width) / 2
+        let imgY = (canvasSize.height - imgSize.height) / 2
+        let imgRect = CGRect(x: imgX, y: imgY, width: imgSize.width, height: imgSize.height)
+
+        let clipPath = CGPath(roundedRect: imgRect, cornerWidth: 12, cornerHeight: 12, transform: nil)
+        ctx.addPath(clipPath)
+        ctx.clip()
+        windowImage.draw(in: imgRect)
+
+        result.unlockFocus()
+        return result
+    }
+}
+
+// MARK: - Gradient swatch button
+
+private final class GradientSwatchButton: NSButton {
+    private let fromColor: NSColor
+    private let toColor: NSColor
+
+    init(from: NSColor, to: NSColor, tag: Int) {
+        self.fromColor = from
+        self.toColor = to
+        super.init(frame: .zero)
+        self.tag = tag
+        self.title = ""
+        self.isBordered = false
+        self.bezelStyle = .regularSquare
+        self.wantsLayer = true
+        self.layer?.cornerRadius = 8
+        self.layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let gradient = NSGradient(starting: fromColor, ending: toColor)!
+        gradient.draw(in: bounds, angle: 135)
+    }
+}
+
+// MARK: - Color swatch button (opens NSColorPanel)
+
+private final class ColorWheelButton: NSView {
+    var onColorPicked: ((NSColor) -> Void)?
+    private var currentColor: NSColor = .white
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1.5
+        layer?.borderColor = NSColor(calibratedWhite: 0.5, alpha: 1).cgColor
+        layer?.backgroundColor = currentColor.cgColor
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {
+        let panel = NSColorPanel.shared
+        panel.mode = .wheel
+        panel.color = currentColor
+        panel.setTarget(self)
+        panel.setAction(#selector(colorChanged(_:)))
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func colorChanged(_ sender: NSColorPanel) {
+        currentColor = sender.color
+        layer?.backgroundColor = currentColor.cgColor
+        onColorPicked?(currentColor)
     }
 }
