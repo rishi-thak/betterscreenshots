@@ -4,7 +4,7 @@ import Foundation
 @MainActor
 final class ActionOverlayController: NSObject {
     private let panel: NSPanel
-    private let containerView = NSView()
+    private let containerView = ClickableContainerView()
     private let previewImageView = DraggableImageView()
     private let shareButton = NSButton()
     private let deleteButton = NSButton()
@@ -171,9 +171,10 @@ final class ActionOverlayController: NSObject {
     }
 
     private func configureInteraction() {
-        let clickRecognizer = NSClickGestureRecognizer(target: self, action: #selector(openScreenshot))
-        clickRecognizer.buttonMask = 0x1
-        containerView.addGestureRecognizer(clickRecognizer)
+        containerView.onClickThrough = { [weak self] in
+            guard let self, let screenshot = self.currentScreenshot else { return }
+            self.onOpen(screenshot, self.currentIsWindowCapture)
+        }
     }
 
     private func scheduleHide() {
@@ -240,19 +241,6 @@ final class ActionOverlayController: NSObject {
         button.toolTip = symbolName == "trash" ? "Delete screenshot file" : "Share screenshot"
     }
 
-    @objc
-    private func openScreenshot(_ recognizer: NSClickGestureRecognizer) {
-        let location = recognizer.location(in: containerView)
-        if buttonStack.frame.contains(location) {
-            return
-        }
-
-        guard let screenshot = currentScreenshot else {
-            return
-        }
-
-        onOpen(screenshot, currentIsWindowCapture)
-    }
 }
 
 @MainActor
@@ -272,5 +260,19 @@ private final class DraggableImageView: NSImageView, NSDraggingSource {
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
         return context == .outsideApplication ? [.copy] : []
+    }
+}
+
+@MainActor
+private final class ClickableContainerView: NSView {
+    var onClickThrough: (() -> Void)?
+
+    override func mouseUp(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        // Only fire if the click didn't land on a button subview
+        let hitButton = subviews.flatMap { $0.subviews + [$0] }.contains {
+            $0 is NSButton && $0.frame.contains(convert(pt, to: $0.superview))
+        }
+        if !hitButton { onClickThrough?() }
     }
 }
