@@ -25,10 +25,10 @@ final class ScreenshotAgent {
     )
     private lazy var hotKeyManager = HotKeyManager(
         onFullScreen: { [weak self] in
-            self?.captureFullScreen()
+            Task { @MainActor [weak self] in self?.captureFullScreen() }
         },
         onRegion: { [weak self] in
-            self?.beginRegionCapture()
+            Task { @MainActor [weak self] in self?.beginRegionCapture() }
         }
     )
 
@@ -38,7 +38,18 @@ final class ScreenshotAgent {
 
     func start() {
         handlePermissionState(permissionManager.requestIfNeededAtLaunch())
-        handleAccessibilityState(accessibilityPermissionManager.requestAtLaunch())
+        _ = accessibilityPermissionManager.requestAtLaunch()
+        pollAccessibility()
+    }
+
+    private func pollAccessibility() {
+        if AXIsProcessTrusted() {
+            hotKeyManager.start()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.pollAccessibility()
+        }
     }
 
     private func captureFullScreen() {
