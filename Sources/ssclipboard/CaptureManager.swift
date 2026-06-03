@@ -98,6 +98,12 @@ final class CaptureManager {
         return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen, isWindowCapture: isWindowCapture)
     }
 
+    func saveScrollCapture(_ cgImage: CGImage) -> CaptureResult? {
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        guard let screenshot = save(cgImage: cgImage) else { return nil }
+        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: NSScreen.main, isWindowCapture: false)
+    }
+
     private func makeCompositeImage(for screens: [NSScreen], canvasRect: CGRect) -> CGImage? {
         let width = Int(canvasRect.width.rounded(.up))
         let height = Int(canvasRect.height.rounded(.up))

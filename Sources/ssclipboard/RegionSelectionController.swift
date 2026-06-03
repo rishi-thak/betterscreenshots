@@ -4,7 +4,8 @@ import Foundation
 
 struct RegionResult {
     let rect: CGRect
-    let windowID: CGWindowID?  // non-nil when user snapped to a window
+    let windowID: CGWindowID?
+    let scrollMode: Bool
 }
 
 @MainActor
@@ -15,6 +16,10 @@ final class RegionSelectionController: NSObject {
     private var localKeyMonitor: Any?
     private var globalKeyMonitor: Any?
     private var globalMouseMonitor: Any?
+
+    /// Installed into the CGEvent tap while selection is active.
+    /// Returns true to suppress the event system-wide.
+    private(set) var keyInterceptor: (@Sendable (CGEvent) -> Bool)?
 
     func beginSelection(onComplete: @escaping (RegionResult?) -> Void) {
         cancelSelection()
@@ -57,12 +62,25 @@ final class RegionSelectionController: NSObject {
 
         self.panel = panel
         self.selectionView = selectionView
+        self.keyInterceptor = { [weak self] event in
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            if keyCode == Int64(kVK_Escape) {
+                DispatchQueue.main.async { self?.finishSelection(with: nil) }
+                return true
+            }
+            if keyCode == Int64(kVK_Space) {
+                DispatchQueue.main.async { self?.selectionView?.toggleScrollMode() }
+                return true
+            }
+            return false
+        }
     }
 
     private func finishSelection(with result: RegionResult?) {
         removeEscapeMonitor()
         removeMouseMonitor()
         NSCursor.unhide()
+        keyInterceptor = nil
         panel?.orderOut(nil)
         panel = nil
         selectionView = nil
@@ -148,6 +166,7 @@ private final class SelectionOverlayView: NSView {
     // Window snap state
     private var snapWindowID: CGWindowID?
     private var snapRect: CGRect?   // in view coordinates
+    private var scrollMode = false  // toggled by Space when a window is snapped
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -159,6 +178,26 @@ private final class SelectionOverlayView: NSView {
     func updateCursorPosition(_ point: CGPoint) {
         cursorPoint = point
         needsDisplay = true
+    }
+
+    func toggleScrollMode() {
+        guard let wid = snapWindowID, dragStart == nil else { return }
+        if !scrollMode {
+            // First Space: start recording
+            scrollMode = true
+            needsDisplay = true
+            // Emit immediately with scroll mode — no click needed
+            let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+            guard let sr = snapRect else { return }
+            let globalRect = CGRect(
+                x: sr.origin.x + panelOrigin.x,
+                y: sr.origin.y + panelOrigin.y,
+                width: sr.width,
+                height: sr.height
+            )
+            onComplete?(RegionResult(rect: globalRect, windowID: wid, scrollMode: true))
+        }
+        // Second Space is handled by ScreenshotAgent's tap interceptor to stop recording
     }
 
     override func updateTrackingAreas() {
@@ -183,6 +222,7 @@ private final class SelectionOverlayView: NSView {
         let cgPt = CGPoint(x: screenPt.x, y: primaryHeight - screenPt.y)
 
         if let win = frontmostWindowInfo(at: cgPt) {
+            if win.id != snapWindowID { scrollMode = false }
             snapWindowID = win.id
             // Convert CG rect (top-left origin) back to view coordinates
             let winRectNS = CGRect(
@@ -206,16 +246,25 @@ private final class SelectionOverlayView: NSView {
 
         // Window snap highlight
         if dragStart == nil, let sr = snapRect {
-            // Clear the window area
             NSColor.clear.setFill()
             __NSRectFillUsingOperation(sr, .clear)
-            // Blue highlight border
             let path = NSBezierPath(roundedRect: sr, xRadius: 8, yRadius: 8)
-            NSColor.systemBlue.withAlphaComponent(0.35).setFill()
+            let tint = scrollMode ? NSColor.systemGreen : NSColor.systemBlue
+            tint.withAlphaComponent(0.35).setFill()
             path.fill()
-            NSColor.systemBlue.setStroke()
+            tint.setStroke()
             path.lineWidth = 2
             path.stroke()
+
+            // Hint label
+            let label = scrollMode ? "Recording — Space to stop" : "Space to record scroll"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor.white
+            ]
+            let size = (label as NSString).size(withAttributes: attrs)
+            let labelRect = CGRect(x: sr.midX - size.width / 2, y: sr.maxY + 8, width: size.width, height: size.height)
+            (label as NSString).draw(in: labelRect, withAttributes: attrs)
         }
 
         // Manual selection rect
@@ -274,15 +323,16 @@ private final class SelectionOverlayView: NSView {
             let cgPt = CGPoint(x: screenPt.x, y: primaryHeight - screenPt.y)
 
             if let win = frontmostWindowInfo(at: cgPt) {
-                // Convert CG window rect to global NS coordinates for capture
                 let globalRect = CGRect(
                     x: win.rect.origin.x,
                     y: primaryHeight - win.rect.origin.y - win.rect.height,
                     width: win.rect.width,
                     height: win.rect.height
                 )
-                onComplete?(RegionResult(rect: globalRect, windowID: win.id))
+                NSLog("SSC: mouseUp snap windowID=%u scrollMode=%d", win.id, scrollMode ? 1 : 0)
+                onComplete?(RegionResult(rect: globalRect, windowID: win.id, scrollMode: scrollMode))
             } else {
+                NSLog("SSC: mouseUp snap — no window found")
                 onComplete?(nil)
             }
         } else {
@@ -294,7 +344,7 @@ private final class SelectionOverlayView: NSView {
                 width: sel.width,
                 height: sel.height
             )
-            onComplete?(RegionResult(rect: globalRect, windowID: nil))
+            onComplete?(RegionResult(rect: globalRect, windowID: nil, scrollMode: false))
         }
         dragStart = nil
     }
