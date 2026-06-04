@@ -1,21 +1,170 @@
 # SSClipboard
 
-A lightweight, invisible macOS screenshot agent that intercepts the standard screenshot hotkeys, captures the screen directly, and immediately copies the result to your clipboard — no extra steps required.
+**A headless macOS screenshot agent** that intercepts `Cmd+Shift+3` / `Cmd+Shift+4`, runs a custom capture pipeline (save → clipboard → optional UI), and adds **scroll-stitch capture** — with no Dock icon and no extra paste step.
 
-It runs as a background login agent with no Dock icon, no menu bar icon, and no UI of its own. The only visible surface is a small transient overlay that appears after each capture with quick **Share** and **Delete** actions.
+Built as a **Swift 6** Swift Package Manager executable (no Xcode project), distributed as a code-signed `.app` bundle, and launched at login via **`launchd`**. Global shortcuts are handled by a **`CGEvent` session tap on a dedicated background thread**; UI and orchestration stay on **`@MainActor`**.
+
+---
+
+## Problem
+
+macOS screenshots are fast, but the default flow still adds friction: mentally tracking save location, opening Preview or Finder, copying again for chat or docs, and no first-party **tall-content / scroll-stitch** capture. SSClipboard keeps familiar shortcuts while routing every successful capture to the clipboard immediately and layering a custom post-capture surface (transient overlay + full viewer) that Apple does not expose through public screenshot APIs.
+
+---
+
+## Engineering highlights
+
+| Area | What the code does |
+|------|-------------------|
+| **Global input** | `CGEvent.tapCreate` at `.cgSessionEventTap` / `.headInsertEventTap` on thread `com.rishi.ssclipboard.eventtap` with its own `CFRunLoop` — tap callbacks never block the main run loop |
+| **Swift 6 concurrency** | `swiftLanguageModes: [.v6]`; capture orchestration and AppKit UI on `@MainActor`; `HotKeyManager` is `@unchecked Sendable` with `@Sendable` closures across threads |
+| **Scroll stitching** | `ScrollingCaptureController` samples `CGWindowListCreateImage` on a 0.4s timer, deduplicates static frames via strided row comparison, then **`findOverlap`** matches bottom rows of frame *n* to top rows of *n+1* and composites unique strips into one bitmap |
+| **Multi-display** | Full-screen path unions `NSScreen` frames and blits each display via `CGDisplayCreateImage` onto one canvas |
+| **Coordinate systems** | AppKit (bottom-left) ↔ Quartz (top-left) Y-flip for overlay drawing, window hit-testing, and `CGWindowListCreateImage` rects |
+| **Window polish** | Layer-0 hit test via `CGWindowListCopyWindowInfo`; 12pt rounded-corner alpha mask on window captures |
+| **Viewer tools** | `ImageTextRecognizer` — on-device Vision OCR with **Copy Text** in the viewer; `ImageRedactionEditor` — drag regions to blur or solid-fill sensitive areas |
+| **Ops** | `os.Logger` categories (`SSCLog`); menu-bar permission status (`PermissionStatusController`) with System Settings deep links; `AppSettings` UserDefaults suite; delete-to-trash with **8s undo** in the action overlay |
 
 ---
 
 ## Features
 
-- **Instant clipboard copy** — every capture is written to the clipboard the moment it's taken, before you've even moved your mouse
-- **Full-screen capture** — `Cmd+Shift+3` composites all connected displays into a single image
-- **Region / window capture** — `Cmd+Shift+4` opens a crosshair overlay; click a window to snap it with rounded corners, or drag to select an arbitrary region
-- **Saves to your screenshot folder** — respects the location and format configured in `com.apple.screencapture` (defaults to Desktop, PNG)
-- **Transient action overlay** — a small panel appears in the bottom-right corner for 6 seconds with Share and Delete buttons; click the preview thumbnail to open the full viewer
-- **Full-screen viewer** — zoom, copy, share, reveal in Finder, delete, and add a decorative background to window captures
-- **Background editor** — for window captures, choose a gradient or solid-color background, adjust padding, and lock to a common aspect ratio (1:1, 4:3, 16:9, 3:2) before saving
-- **Runs at login** — installed as a `launchd` LaunchAgent so it's always available
+- **Instant clipboard** — every successful capture is written to `NSPasteboard` before the user moves on (`ClipboardWriter`)
+- **Full-screen (`Cmd+Shift+3`)** — composites all displays onto one `CGImage`
+- **Region / window (`Cmd+Shift+4`)** — borderless multi-display overlay (`.screenSaver` level); software crosshair; hover to snap a window (blue highlight); drag for manual region; AppKit ↔ Quartz coordinate conversion
+- **Scrolling capture** — snap a window, **Space** to start scroll recording, scroll the target content, **Space** to stop; frames are stitched into one tall image, then saved and copied
+- **Native save location** — reads `com.apple.screencapture` for folder and format (PNG / JPEG / TIFF / HEIC, etc.) via `ScreenshotConfiguration`
+- **Transient action overlay** — bottom-right panel (default ~6s, configurable via `AppSettings`) with Share, Delete, and draggable preview; click preview to open the viewer
+- **Full-screen viewer** — zoom, copy, share, reveal in Finder, delete; window captures expose a **background editor** (gradient / solid, padding, aspect presets 1:1, 4:3, 16:9, 3:2)
+- **Copy text (OCR)** — viewer toolbar runs `VNRecognizeTextRequest` and copies recognized text to the clipboard
+- **Redact / blur** — drag one or more regions in the viewer; apply Gaussian blur or solid black, then save back to disk
+- **Permission UX** — Screen Recording + Accessibility prompts at launch; menu-bar status item with deep links to System Settings when permissions are missing
+- **Login agent** — `RunAtLoad` + `KeepAlive` via `launchd`
+
+### Scrolling capture workflow
+
+| Step | Action |
+|------|--------|
+| 1 | `Cmd+Shift+4` — region overlay appears across all displays |
+| 2 | Move over a scrollable window until it highlights (**blue**); click for a normal window shot, or press **Space** while snapped to enter scroll mode (**green**) and start recording |
+| 3 | Scroll the window content; frames sample on a timer while pixels change (static frames are skipped) |
+| 4 | **Space** — stop recording, stitch overlaps, save, copy to clipboard, show action overlay |
+| — | **Escape** — cancel during region selection; also ends scroll recording (handled by the same global key interceptor) |
+
+A HUD (*Recording — Space to stop*) appears in the bottom-right while scroll capture is active.
+
+> **Tip:** Rebind or disable macOS’s built-in screenshot shortcuts so SSClipboard can own `Cmd+Shift+3/4`: **System Settings → Keyboard → Keyboard Shortcuts → Screenshots**.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph launch["Launch"]
+        LA["launchd LaunchAgent"]
+        AD["AppDelegate"]
+        SA["ScreenshotAgent @MainActor"]
+    end
+
+    subgraph perms["Permissions"]
+        SCP["ScreenCapturePermissionManager"]
+        AXP["AccessibilityPermissionManager"]
+        PSC["PermissionStatusController"]
+    end
+
+    subgraph input["Input — dedicated thread"]
+        HK["HotKeyManager @unchecked Sendable"]
+        TAP["CGEvent tap .cgSessionEventTap"]
+        RL["CFRunLoop on background Thread"]
+        HK --> TAP --> RL
+    end
+
+    subgraph capture["Capture"]
+        CM["CaptureManager"]
+        RS["RegionSelectionController"]
+        SC["ScrollingCaptureController"]
+        CM --> CGW["CGWindowListCreateImage"]
+        CM --> CGD["CGDisplayCreateImage"]
+        SC --> STITCH["Pixel-row overlap + stitch"]
+    end
+
+    subgraph output["Output"]
+        CFG["ScreenshotConfiguration"]
+        CB["ClipboardWriter"]
+        AO["ActionOverlayController"]
+        VW["ScreenshotViewerController"]
+        OCR["ImageTextRecognizer — Vision"]
+    end
+
+    LA --> AD --> SA
+    SA --> SCP & AXP & PSC
+    AXP -->|trusted| HK
+    HK -->|Cmd+Shift+3| CM
+    HK -->|Cmd+Shift+4| RS
+    RS -->|Space + snapped window| SC
+    SC --> CM
+    CM --> CFG
+    CM --> CB --> AO
+    AO --> VW
+    VW -.-> OCR
+```
+
+### Module map
+
+```
+Sources/ssclipboard/
+├── main.swift                         # NSApplication, .prohibited activation policy
+├── AppDelegate.swift                  # Boots ScreenshotAgent
+├── ScreenshotAgent.swift              # Coordinator: permissions, hotkeys, capture, scroll HUD
+├── HotKeyManager.swift                # CGEvent tap on dedicated thread; keyInterceptor hook
+├── CaptureManager.swift               # Full-screen composite, region/window, scroll save, rounded mask
+├── RegionSelectionController.swift    # Multi-display overlay, window snap, scroll mode (Space)
+├── ScrollingCaptureController.swift   # Timed frames + row-wise overlap stitch
+├── ActionOverlayController.swift      # Transient share/delete panel
+├── ScreenshotViewerController.swift   # Zoom viewer + background editor
+├── ImageTextRecognizer.swift          # VNRecognizeTextRequest (async, accurate)
+├── ImageRedactionEditor.swift         # Region picker + Core Image blur/solid redaction
+├── ClipboardWriter.swift
+├── ScreenshotConfiguration.swift      # com.apple.screencapture location/type
+├── ScreenshotClassifier.swift
+├── ScreenshotFile.swift
+├── AppSettings.swift                  # overlay duration, clipboard toggle (UserDefaults suite)
+├── PermissionStatusController.swift   # Menu-bar permission status + Settings deep links
+├── AccessibilityPermissionManager.swift
+├── ScreenCapturePermissionManager.swift
+└── SSCLog.swift                       # os.Logger categories
+```
+
+### Technical deep dive
+
+**`HotKeyManager`** — Installs the session event tap on a **dedicated `Thread`** (`qualityOfService = .userInteractive`), not the main thread. The callback suppresses `Cmd+Shift+3/4` keyDown/keyUp (`return nil`), re-enables the tap on `tapDisabledByTimeout`, and dispatches capture work with `DispatchQueue.main.async`. `keyInterceptor` lets the region overlay and scroll HUD consume **Space** / **Escape** system-wide while active.
+
+**`CaptureManager`** — `captureFullScreen()` unions screen frames and blits each display; `captureRegion` / `captureWindow` use `CGWindowListCreateImage` with appropriate option sets; window captures get a **12pt** rounded clip path; scroll results go through `saveScrollCapture`.
+
+**`ScrollingCaptureController`** — Samples the target `CGWindowID` every **0.4s**, skips duplicate frames via strided `UInt32` row comparison (`imagesLookSame`), then stitches by extracting per-row buffers, running **`findOverlap`** (bottom of *prev* vs top of *curr*, tolerance `0x0A0A0A` per channel stride), and drawing cropped unique strips bottom-up in a single `CGContext`.
+
+**`RegionSelectionController`** — Borderless `NSPanel` spanning all displays; software crosshair; window highlight **blue → green** in scroll mode; `CGWindowListCopyWindowInfo` layer-0 hit test; integrates with the event tap for Escape/Space during selection.
+
+**`ActionOverlayController`** / **`ScreenshotViewerController`** — Non-activating overlay at `.statusBar`; viewer with scroll/zoom, `NSSharingServicePicker`, and `BackgroundEditorView` for presentation-style window shots.
+
+---
+
+## Tech stack
+
+| Layer | Choice |
+|-------|--------|
+| Language | Swift 6 (`swiftLanguageModes: [.v6]`, tools 6.3) |
+| Packaging | Swift Package Manager executable (no `.xcodeproj`) |
+| UI | AppKit (`NSPanel`, `NSWindow`, custom `NSView` drawing) |
+| Capture | Core Graphics (`CGWindowListCreateImage`, `CGDisplayCreateImage`, `CGImageDestination`) |
+| Vision / image processing | Vision (`VNRecognizeTextRequest`), Core Image (redaction) |
+| Input | Application Services / Carbon (`CGEvent` tap, virtual key codes) |
+| Persistence | Native screenshot folder + `ImageIO` encode; `AppSettings` UserDefaults suite |
+| Logging | `os.Logger` (`SSCLog`) |
+| Distribution | `SSClipboard.app` bundle + ad hoc / Developer ID `codesign` |
+| Runtime | `launchd` LaunchAgent (`KeepAlive`, `RunAtLoad`) |
+| Platform | macOS 13+ |
 
 ---
 
@@ -23,21 +172,19 @@ It runs as a background login agent with no Dock icon, no menu bar icon, and no 
 
 - macOS 13 Ventura or later
 - Xcode Command Line Tools (`xcode-select --install`)
-- **Screen Recording** permission (prompted on first launch)
-- **Accessibility** permission (required for the global hotkey tap)
+- **Screen Recording** — required for `CGWindowListCreateImage` / display capture
+- **Accessibility** — required for the global `CGEvent` tap
 
 ---
 
 ## Hotkeys
 
 | Shortcut | Action |
-|---|---|
+|----------|--------|
 | `Cmd+Shift+3` | Full-screen capture (all displays) |
-| `Cmd+Shift+4` | Region / window capture |
+| `Cmd+Shift+4` | Region / window capture (see scrolling workflow above) |
 
-> **Important:** these shortcuts shadow the built-in macOS screenshot shortcuts. For SSClipboard to intercept them reliably, disable or rebind the native ones in:
->
-> **System Settings → Keyboard → Keyboard Shortcuts → Screenshots**
+During region select or scroll recording, **Space** and **Escape** are handled by SSClipboard (not passed to the foreground app).
 
 ---
 
@@ -48,17 +195,18 @@ It runs as a background login agent with no Dock icon, no menu bar icon, and no 
 ```
 
 The script:
-1. Runs `swift build -c release`
-2. Assembles `dist/SSClipboard.app` with the correct `Info.plist`
-3. Code-signs the bundle if a Developer ID or Apple Development certificate is available (auto-detected via `security find-identity`)
 
-The finished bundle is written to:
+1. Runs `swift build -c release`
+2. Assembles `dist/SSClipboard.app` with `App/Info.plist`
+3. Code-signs when a Developer ID or Apple Development identity is found (`security find-identity`)
+
+Output:
 
 ```
 dist/SSClipboard.app
 ```
 
-To override the signing identity:
+Override signing:
 
 ```bash
 SSC_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/build_app.sh
@@ -66,21 +214,22 @@ SSC_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/bu
 
 ---
 
-## Install as a Login Agent
+## Install as a login agent
 
 ```bash
 ./scripts/install_launch_agent.sh
 ```
 
 This script:
-1. Builds the app (calls `build_app.sh` internally)
+
+1. Builds the app (invokes `build_app.sh`)
 2. Copies the bundle to `~/Applications/SSClipboard.app`
-3. Writes a LaunchAgent plist to `~/Library/LaunchAgents/com.rishi.ssclipboard.plist`
-4. Loads the agent with `launchctl load`
+3. Writes `~/Library/LaunchAgents/com.rishi.ssclipboard.plist`
+4. Unloads any previous agent, kills stray `ssclipboard` processes, and `launchctl load`s the plist
 
-The agent is configured with `RunAtLoad = true` and `KeepAlive = true`, so it starts immediately and restarts automatically if it ever exits.
+The agent uses `RunAtLoad` and `KeepAlive` so it starts at login and restarts if it exits.
 
-To uninstall:
+**Uninstall:**
 
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.rishi.ssclipboard.plist
@@ -94,77 +243,33 @@ rm -rf ~/Applications/SSClipboard.app
 
 On first launch, SSClipboard requests two permissions:
 
-**Screen Recording** (`ScreenCaptureKit` / `CGWindowListCreateImage`)
-Required to capture screen content. Prompted automatically. If denied, captures will silently fail (the app beeps). Grant it in **System Settings → Privacy & Security → Screen Recording**.
+**Screen Recording** (`CGPreflightScreenCaptureAccess` / `CGRequestScreenCaptureAccess`)  
+Needed for screen and window pixels. If denied after the one-time prompt, captures fail and the app beeps; a menu-bar status item can surface **Open Screen Recording Settings**. Grant in **System Settings → Privacy & Security → Screen Recording**. After the first grant, the agent schedules a **1 second** terminate/restart so the entitlement applies.
 
-**Accessibility** (`CGEvent.tapCreate`)
-Required to intercept global keyboard events for the hotkeys. Prompted automatically. If denied, hotkeys won't fire. Grant it in **System Settings → Privacy & Security → Accessibility**.
-
-After granting Screen Recording for the first time, the app schedules a restart (1 second delay) so the new entitlement takes effect.
+**Accessibility** (`AXIsProcessTrustedWithOptions`)  
+Needed for `CGEvent.tapCreate`. If denied, hotkeys never register; the agent polls every second until trust is granted, then starts the tap. Grant in **System Settings → Privacy & Security → Accessibility**.
 
 ---
 
-## Architecture
+## Why a custom overlay
 
-SSClipboard is a Swift Package Manager executable that links AppKit, ApplicationServices, Carbon, ImageIO, and UniformTypeIdentifiers directly — no SwiftUI, no Xcode project file.
-
-```
-Sources/ssclipboard/
-├── main.swift                      # NSApplication bootstrap, .prohibited activation policy
-├── AppDelegate.swift               # Creates and starts ScreenshotAgent
-├── ScreenshotAgent.swift           # Top-level coordinator
-├── HotKeyManager.swift             # CGEvent tap for Cmd+Shift+3/4
-├── CaptureManager.swift            # CGWindowListCreateImage / CGDisplayCreateImage
-├── RegionSelectionController.swift # Full-screen crosshair overlay panel + window snap
-├── ScreenshotMonitor.swift         # DispatchSource file-system watcher (unused in hotkey path)
-├── ScreenshotViewerController.swift# Full viewer window + background editor
-├── ActionOverlayController.swift   # Transient bottom-right panel
-├── ClipboardWriter.swift           # NSPasteboard helper
-├── ScreenshotConfiguration.swift   # Reads com.apple.screencapture defaults
-├── ScreenshotClassifier.swift      # Filename heuristic for screenshot detection
-├── ScreenshotFile.swift            # Value type: id, url, createdAt
-├── AccessibilityPermissionManager.swift
-└── ScreenCapturePermissionManager.swift
-```
-
-### Key components
-
-**`ScreenshotAgent`** is the central coordinator. It holds all subsystems and wires them together: permission managers → hotkey manager → capture manager → overlay/viewer.
-
-**`HotKeyManager`** installs a `CGEvent` tap at `.cgSessionEventTap` with `.headInsertEventTap` placement. It intercepts `keyDown`/`keyUp` events for `kVK_ANSI_3` and `kVK_ANSI_4` when `Cmd+Shift` is the only modifier, suppresses the original event (returns `nil`), and dispatches to the appropriate capture path. A re-enable guard handles `tapDisabledByTimeout`.
-
-**`CaptureManager`** has three capture modes:
-- `captureFullScreen()` — iterates `NSScreen.screens`, calls `CGDisplayCreateImage` per display, composites them onto a single `CGContext` canvas, saves to disk, and returns the result
-- `captureRegion(_:)` — calls `CGWindowListCreateImage` with `.optionOnScreenOnly` for the selected rect
-- `captureWindow(windowID:rect:)` — calls `CGWindowListCreateImage` with `.optionIncludingWindow` and `.boundsIgnoreFraming`, then applies a 12pt rounded-corner mask via a `CGContext` clip path
-
-**`RegionSelectionController`** creates a borderless `NSPanel` at `.screenSaver` level spanning all displays. The embedded `SelectionOverlayView` draws a semi-transparent tint, a software crosshair, and a window-snap highlight. On mouse-up with drag distance < 5pt it treats the gesture as a window click and queries `CGWindowListCopyWindowInfo` for the frontmost normal-layer window under the cursor.
-
-**`ActionOverlayController`** is a non-activating `NSPanel` at `.statusBar` level. It fades in on presentation, auto-hides after 6 seconds, and supports drag-to-share from the preview thumbnail via `NSDraggingSource`.
-
-**`ScreenshotViewerController`** is a full `NSWindow` with a dark background, a scrollable/zoomable `NSImageView`, and a frosted-glass toolbar. The background editor (`BackgroundEditorView`) composites the window screenshot onto a gradient or solid-color canvas at a chosen aspect ratio and padding, previewing live before saving.
-
-**`ScreenshotConfiguration`** reads `UserDefaults(suiteName: "com.apple.screencapture")` for the `location` and `type` keys so captures land in the same folder and format as native macOS screenshots.
-
----
-
-## Why a custom overlay instead of the system thumbnail
-
-macOS does not expose a public API for injecting buttons into the native screenshot preview thumbnail. SSClipboard runs as an agent (`.prohibited` activation policy, no Dock icon) and presents its own panel instead.
+macOS does not provide a public API to add actions to the system screenshot thumbnail. SSClipboard runs with `.prohibited` activation policy (no Dock tile) and shows its own short-lived panel and optional full viewer instead.
 
 ---
 
 ## Development
 
 ```bash
-# Debug build and run
+# Debug run
 swift run
 
-# Release build only
+# Release build
 swift build -c release
 
 # Tests
 swift test
 ```
 
-The package targets Swift 6 language mode (`swiftLanguageModes: [.v6]`). All AppKit work is isolated to `@MainActor`; background work (file I/O, image encoding) runs on dedicated `DispatchQueue`s.
+All AppKit-facing types are `@MainActor`; the event tap and its run loop live off the main thread. Image encoding and file I/O run synchronously on the main actor today — acceptable for screenshot-sized payloads.
+
+Logs (when running from the `.app` bundle): Console.app → filter subsystem `com.rishi.ssclipboard`, categories `capture`, `scroll`, `permissions`, `selection`, `overlay`.

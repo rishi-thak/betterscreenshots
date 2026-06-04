@@ -3,23 +3,34 @@ import Foundation
 
 @MainActor
 final class ActionOverlayController: NSObject {
+    private struct PendingUndoDelete {
+        let screenshot: ScreenshotFile
+        let trashedURL: URL
+    }
+
     private let panel: NSPanel
     private let containerView = ClickableContainerView()
     private let previewImageView = DraggableImageView()
     private let shareButton = NSButton()
     private let deleteButton = NSButton()
+    private let undoButton = NSButton()
     private let buttonStack = NSStackView()
+    private let appSettings: AppSettings
     private let onDelete: (ScreenshotFile) -> Void
     private let onOpen: (ScreenshotFile, Bool) -> Void
     private var currentScreenshot: ScreenshotFile?
     private var currentIsWindowCapture = false
     private var autoHideWorkItem: DispatchWorkItem?
+    private var undoDeleteWorkItem: DispatchWorkItem?
+    private var pendingUndoDelete: PendingUndoDelete?
     private var isVisible = false
 
     init(
+        appSettings: AppSettings = .shared,
         onDelete: @escaping (ScreenshotFile) -> Void = { _ in },
         onOpen: @escaping (ScreenshotFile, Bool) -> Void = { _, _ in }
     ) {
+        self.appSettings = appSettings
         self.onDelete = onDelete
         self.onOpen = onOpen
         panel = NSPanel(
@@ -36,11 +47,15 @@ final class ActionOverlayController: NSObject {
     }
 
     func present(for screenshot: ScreenshotFile, previewImage: NSImage? = nil, on screen: NSScreen? = nil, isWindowCapture: Bool = false) {
+        clearUndoDeleteState()
         currentScreenshot = screenshot
         currentIsWindowCapture = isWindowCapture
         previewImageView.image = previewImage ?? NSImage(contentsOf: screenshot.url)
         previewImageView.fileURL = screenshot.url
         deleteButton.isEnabled = FileManager.default.fileExists(atPath: screenshot.url.path)
+        deleteButton.isHidden = false
+        undoButton.isHidden = true
+        SSCLog.overlay.debug("presenting overlay for \(screenshot.url.lastPathComponent, privacy: .public)")
 
         if let screen = screen ?? NSScreen.main ?? NSScreen.screens.first {
             let visibleFrame = screen.visibleFrame
@@ -82,14 +97,54 @@ final class ActionOverlayController: NSObject {
             return
         }
 
+        deleteButton.isEnabled = false
+        NSWorkspace.shared.recycle([screenshot.url]) { [weak self] recycledURLs, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let error {
+                    SSCLog.overlay.error("failed to recycle screenshot: \(error.localizedDescription, privacy: .public)")
+                    NSSound.beep()
+                    self.deleteButton.isEnabled = FileManager.default.fileExists(atPath: screenshot.url.path)
+                    return
+                }
+
+                self.onDelete(screenshot)
+                guard let trashedURL = recycledURLs[screenshot.url] ?? recycledURLs.values.first else {
+                    SSCLog.overlay.warning("recycle succeeded without returned trash URL")
+                    self.currentScreenshot = nil
+                    self.hideImmediately()
+                    return
+                }
+
+                SSCLog.overlay.info("screenshot recycled, undo available for 8 seconds")
+                self.currentScreenshot = nil
+                self.beginUndoDeleteState(screenshot: screenshot, trashedURL: trashedURL)
+            }
+        }
+    }
+
+    @objc
+    private func undoDeleteScreenshot(_ sender: NSButton) {
+        guard let pendingUndoDelete else {
+            return
+        }
+
+        undoDeleteWorkItem?.cancel()
         do {
-            try FileManager.default.removeItem(at: screenshot.url)
-            onDelete(screenshot)
-            deleteButton.isEnabled = false
-            currentScreenshot = nil
-            hideImmediately()
+            if FileManager.default.fileExists(atPath: pendingUndoDelete.screenshot.url.path) {
+                try FileManager.default.removeItem(at: pendingUndoDelete.screenshot.url)
+            }
+            try FileManager.default.moveItem(at: pendingUndoDelete.trashedURL, to: pendingUndoDelete.screenshot.url)
+            currentScreenshot = pendingUndoDelete.screenshot
+            clearUndoDeleteState()
+            deleteButton.isEnabled = true
+            scheduleHide()
+            SSCLog.overlay.info("undo restore succeeded for \(pendingUndoDelete.screenshot.url.lastPathComponent, privacy: .public)")
         } catch {
+            SSCLog.overlay.error("undo restore failed: \(error.localizedDescription, privacy: .public)")
             NSSound.beep()
+            clearUndoDeleteState()
+            hideImmediately()
         }
     }
 
@@ -136,6 +191,14 @@ final class ActionOverlayController: NSObject {
             symbolName: "trash",
             action: #selector(deleteScreenshot(_:))
         )
+        configureButton(
+            undoButton,
+            title: "",
+            symbolName: "arrow.uturn.backward",
+            action: #selector(undoDeleteScreenshot(_:))
+        )
+        undoButton.toolTip = "Undo delete"
+        undoButton.isHidden = true
 
         buttonStack.translatesAutoresizingMaskIntoConstraints = false
         buttonStack.orientation = .horizontal
@@ -144,6 +207,7 @@ final class ActionOverlayController: NSObject {
         buttonStack.spacing = 10
         buttonStack.addArrangedSubview(shareButton)
         buttonStack.addArrangedSubview(deleteButton)
+        buttonStack.addArrangedSubview(undoButton)
 
         contentView.addSubview(containerView)
         containerView.addSubview(previewImageView)
@@ -166,7 +230,8 @@ final class ActionOverlayController: NSObject {
             buttonStack.heightAnchor.constraint(equalToConstant: 36),
 
             shareButton.widthAnchor.constraint(equalToConstant: 62),
-            deleteButton.widthAnchor.constraint(equalToConstant: 62)
+            deleteButton.widthAnchor.constraint(equalToConstant: 62),
+            undoButton.widthAnchor.constraint(equalToConstant: 62)
         ])
     }
 
@@ -179,17 +244,52 @@ final class ActionOverlayController: NSObject {
 
     private func scheduleHide() {
         autoHideWorkItem?.cancel()
+        let hideDelay = pendingUndoDelete == nil
+            ? appSettings.overlayDurationSeconds
+            : max(appSettings.overlayDurationSeconds, 8)
 
         let workItem = DispatchWorkItem { [weak self] in
             self?.hideAnimated()
         }
 
         autoHideWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + hideDelay, execute: workItem)
+    }
+
+    private func beginUndoDeleteState(screenshot: ScreenshotFile, trashedURL: URL) {
+        pendingUndoDelete = PendingUndoDelete(screenshot: screenshot, trashedURL: trashedURL)
+        deleteButton.isHidden = true
+        undoButton.isHidden = false
+
+        undoDeleteWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.expireUndoDeleteState()
+        }
+        undoDeleteWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: workItem)
+        scheduleHide()
+    }
+
+    private func clearUndoDeleteState() {
+        undoDeleteWorkItem?.cancel()
+        undoDeleteWorkItem = nil
+        pendingUndoDelete = nil
+        deleteButton.isHidden = false
+        undoButton.isHidden = true
+    }
+
+    private func expireUndoDeleteState() {
+        guard pendingUndoDelete != nil else {
+            clearUndoDeleteState()
+            return
+        }
+        SSCLog.overlay.debug("undo window expired")
+        clearUndoDeleteState()
     }
 
     private func hideImmediately() {
         autoHideWorkItem?.cancel()
+        clearUndoDeleteState()
         panel.orderOut(nil)
         panel.alphaValue = 1
         isVisible = false

@@ -19,12 +19,15 @@ final class ScreenshotViewerController: NSObject {
 
     private let closeButton = NSButton()
     private let copyButton = NSButton()
+    private let copyTextButton = NSButton()
     private let shareButton = NSButton()
     private let revealButton = NSButton()
     private let deleteButton = NSButton()
+    private let redactButton = NSButton()
     private let zoomOutButton = NSButton()
     private let zoomInButton = NSButton()
     private let backgroundButton = NSButton()
+    private let textRecognitionSpinner = NSProgressIndicator()
 
     private var currentScreenshot: ScreenshotFile?
     private var currentImage: NSImage?
@@ -35,6 +38,10 @@ final class ScreenshotViewerController: NSObject {
     // Background editor
     private var backgroundEditorView: BackgroundEditorView?
     private var scrollBottomConstraint: NSLayoutConstraint?
+
+    // Redaction editor
+    private var redactionEditorView: ImageRedactionEditorView?
+    private var redactionControlsView: RedactionControlsView?
 
     init(clipboardWriter: ClipboardWriter, onDelete: @escaping (ScreenshotFile) -> Void) {
         self.clipboardWriter = clipboardWriter
@@ -73,6 +80,9 @@ final class ScreenshotViewerController: NSObject {
         backgroundButton.isEnabled = isWindowCapture
         backgroundButton.alphaValue = isWindowCapture ? 1 : 0.35
         hideBackgroundEditor()
+        exitRedactionMode()
+        textRecognitionSpinner.stopAnimation(nil)
+        copyTextButton.isEnabled = true
 
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -134,12 +144,23 @@ final class ScreenshotViewerController: NSObject {
 
         configureToolbarButton(closeButton, symbol: "xmark", toolTip: "Close", action: #selector(closeViewer))
         configureToolbarButton(copyButton, symbol: "doc.on.doc", toolTip: "Copy", action: #selector(copyScreenshot))
+        configureToolbarButton(copyTextButton, symbol: "text.viewfinder", toolTip: "Copy Text", action: #selector(copyRecognizedText))
         configureToolbarButton(shareButton, symbol: "square.and.arrow.up", toolTip: "Share", action: #selector(shareScreenshot(_:)))
         configureToolbarButton(revealButton, symbol: "folder", toolTip: "Show in Finder", action: #selector(revealInFinder))
         configureToolbarButton(deleteButton, symbol: "trash", toolTip: "Delete", action: #selector(deleteScreenshot))
+        configureToolbarButton(redactButton, symbol: "eye.slash", toolTip: "Redact", action: #selector(toggleRedactionMode))
         configureToolbarButton(backgroundButton, symbol: "photo.artframe", toolTip: "Add Background", action: #selector(toggleBackgroundEditor))
         configureToolbarButton(zoomOutButton, symbol: "minus", toolTip: "Zoom Out", action: #selector(zoomOut))
         configureToolbarButton(zoomInButton, symbol: "plus", toolTip: "Zoom In", action: #selector(zoomIn))
+
+        textRecognitionSpinner.translatesAutoresizingMaskIntoConstraints = false
+        textRecognitionSpinner.style = .spinning
+        textRecognitionSpinner.controlSize = .small
+        textRecognitionSpinner.isDisplayedWhenStopped = false
+        NSLayoutConstraint.activate([
+            textRecognitionSpinner.widthAnchor.constraint(equalToConstant: 14),
+            textRecognitionSpinner.heightAnchor.constraint(equalToConstant: 14)
+        ])
 
         zoomLabel.translatesAutoresizingMaskIntoConstraints = false
         zoomLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
@@ -149,7 +170,7 @@ final class ScreenshotViewerController: NSObject {
         rootView.addSubview(toolbarView)
         rootView.addSubview(imageScrollView)
 
-        let leftStack = NSStackView(views: [closeButton, copyButton, shareButton, revealButton, deleteButton, backgroundButton])
+        let leftStack = NSStackView(views: [closeButton, copyButton, copyTextButton, textRecognitionSpinner, shareButton, revealButton, deleteButton, redactButton, backgroundButton])
         leftStack.translatesAutoresizingMaskIntoConstraints = false
         leftStack.orientation = .horizontal
         leftStack.spacing = 8
@@ -243,11 +264,16 @@ final class ScreenshotViewerController: NSObject {
         imageView.frame = NSRect(origin: NSPoint(x: imgX, y: imgY), size: scaledSize)
         documentView.frame = NSRect(origin: .zero, size: NSSize(width: docW, height: docH))
         imageScrollView.documentView = documentView
+        redactionEditorView?.frame = imageView.frame
+        redactionEditorView?.needsDisplay = true
     }
 
     // MARK: - Background editor
 
     @objc private func toggleBackgroundEditor() {
+        if redactionControlsView != nil {
+            exitRedactionMode()
+        }
         if backgroundEditorView != nil {
             hideBackgroundEditor()
         } else {
@@ -302,19 +328,15 @@ final class ScreenshotViewerController: NSObject {
     }
 
     private func saveComposited(_ image: NSImage) {
-        guard let screenshot = currentScreenshot else { return }
-
-        // Write PNG to disk, overwriting original
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let png = bitmap.representation(using: .png, properties: [:]) else { return }
-
-        try? png.write(to: screenshot.url)
-
-        // Update state
-        currentImage = image
-        imageView.image = image
-        _ = clipboardWriter.copyImage(image)
+        do {
+            try persistEditedImage(image)
+        } catch {
+            showAlert(
+                title: "Couldn't Save Image",
+                message: "The edited screenshot couldn't be saved. Please try again."
+            )
+            return
+        }
         hideBackgroundEditor()
         setZoomScale(fitZoomScale(for: image))
     }
@@ -323,6 +345,37 @@ final class ScreenshotViewerController: NSObject {
 
     @objc private func copyScreenshot() {
         if let image = currentImage { _ = clipboardWriter.copyImage(image) }
+    }
+
+    @objc private func copyRecognizedText() {
+        guard let image = currentImage else { return }
+        copyTextButton.isEnabled = false
+        textRecognitionSpinner.startAnimation(nil)
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.copyTextButton.isEnabled = true
+                self.textRecognitionSpinner.stopAnimation(nil)
+            }
+
+            do {
+                let text = try await ImageTextRecognizer.recognizeText(in: image)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                self.showAlert(
+                    title: "Text Copied",
+                    message: "Copied \(text.count) characters to the clipboard."
+                )
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription
+                    ?? "Text couldn't be recognized in this screenshot."
+                self.showAlert(
+                    title: "Couldn't Copy Text",
+                    message: message
+                )
+            }
+        }
     }
 
     @objc private func shareScreenshot(_ sender: NSButton) {
@@ -347,6 +400,123 @@ final class ScreenshotViewerController: NSObject {
 
     @objc private func zoomOut() { setZoomScale(zoomScale - 0.15) }
     @objc private func zoomIn() { setZoomScale(zoomScale + 0.15) }
+
+    @objc private func toggleRedactionMode() {
+        if redactionControlsView != nil {
+            exitRedactionMode()
+        } else {
+            enterRedactionMode()
+        }
+    }
+
+    private func enterRedactionMode() {
+        guard redactionControlsView == nil, let image = currentImage else { return }
+
+        if backgroundEditorView != nil {
+            hideBackgroundEditor()
+        }
+
+        let controls = RedactionControlsView()
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        controls.onApply = { [weak self] style in
+            self?.applyRedactions(style: style)
+        }
+        controls.onCancel = { [weak self] in
+            self?.exitRedactionMode()
+        }
+        rootView.addSubview(controls)
+        NSLayoutConstraint.activate([
+            controls.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
+            controls.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
+            controls.bottomAnchor.constraint(equalTo: toolbarView.topAnchor),
+            controls.heightAnchor.constraint(equalToConstant: 52)
+        ])
+
+        let redactionOverlay = ImageRedactionEditorView(imageSize: image.size)
+        redactionOverlay.frame = imageView.frame
+        documentView.addSubview(redactionOverlay)
+
+        scrollBottomConstraint?.isActive = false
+        let newBottom = imageScrollView.bottomAnchor.constraint(equalTo: controls.topAnchor)
+        newBottom.isActive = true
+        scrollBottomConstraint = newBottom
+
+        redactionControlsView = controls
+        redactionEditorView = redactionOverlay
+        redactButton.contentTintColor = NSColor.systemBlue
+    }
+
+    private func exitRedactionMode() {
+        redactionEditorView?.removeFromSuperview()
+        redactionEditorView = nil
+        redactionControlsView?.removeFromSuperview()
+        redactionControlsView = nil
+        redactButton.contentTintColor = .white
+
+        scrollBottomConstraint?.isActive = false
+        let newBottom = imageScrollView.bottomAnchor.constraint(equalTo: toolbarView.topAnchor)
+        newBottom.isActive = true
+        scrollBottomConstraint = newBottom
+    }
+
+    private func applyRedactions(style: RedactionStyle) {
+        guard let originalImage = currentImage,
+              let redactionEditorView else { return }
+
+        if redactionEditorView.regions.isEmpty {
+            showAlert(
+                title: "No Redactions Added",
+                message: "Drag on the image to draw one or more regions first."
+            )
+            return
+        }
+
+        guard let redacted = ImageRedactionApplier.apply(
+            to: originalImage,
+            regions: redactionEditorView.regions,
+            style: style
+        ) else {
+            showAlert(
+                title: "Couldn't Apply Redactions",
+                message: "Try adjusting the redaction regions and applying again."
+            )
+            return
+        }
+
+        do {
+            try persistEditedImage(redacted)
+            exitRedactionMode()
+            setZoomScale(fitZoomScale(for: redacted))
+        } catch {
+            showAlert(
+                title: "Couldn't Save Image",
+                message: "The redacted screenshot couldn't be saved. Please try again."
+            )
+        }
+    }
+
+    private func persistEditedImage(_ image: NSImage) throws {
+        guard let screenshot = currentScreenshot else { return }
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        try png.write(to: screenshot.url)
+        currentImage = image
+        imageView.image = image
+        _ = clipboardWriter.copyImage(image)
+    }
+
+    private func showAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
+    }
 }
 
 // MARK: - Background Editor View
@@ -510,7 +680,7 @@ private final class BackgroundEditorView: NSView {
         topRow.orientation = .horizontal
         topRow.spacing = 16
         topRow.alignment = .centerY
-        (topRow.views[1] as! NSView).setContentHuggingPriority(.defaultLow, for: .horizontal)
+        topRow.views[1].setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         let mainStack = NSStackView(views: [topRow, actionStack])
         mainStack.translatesAutoresizingMaskIntoConstraints = false
@@ -672,4 +842,103 @@ private final class ColorWheelButton: NSView {
         layer?.backgroundColor = currentColor.cgColor
         onColorPicked?(currentColor)
     }
+}
+
+@MainActor
+private final class RedactionControlsView: NSVisualEffectView {
+    var onApply: ((RedactionStyle) -> Void)?
+    var onCancel: (() -> Void)?
+
+    private let styleSelector = NSSegmentedControl(labels: ["Blur", "Black"], trackingMode: .selectOne, target: nil, action: nil)
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        material = .underWindowBackground
+        blendingMode = .withinWindow
+        state = .active
+        wantsLayer = true
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor(calibratedWhite: 0.26, alpha: 1).cgColor
+        buildUI()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func buildUI() {
+        styleSelector.translatesAutoresizingMaskIntoConstraints = false
+        styleSelector.selectedSegment = 0
+        styleSelector.target = self
+        styleSelector.action = #selector(styleChanged)
+
+        let styleLabel = NSTextField(labelWithString: "Mode")
+        styleLabel.translatesAutoresizingMaskIntoConstraints = false
+        styleLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        styleLabel.textColor = NSColor(calibratedWhite: 0.8, alpha: 1)
+
+        let styleStack = NSStackView(views: [styleLabel, styleSelector])
+        styleStack.translatesAutoresizingMaskIntoConstraints = false
+        styleStack.orientation = .horizontal
+        styleStack.spacing = 8
+        styleStack.alignment = .centerY
+
+        let applyButton = NSButton()
+        applyButton.translatesAutoresizingMaskIntoConstraints = false
+        applyButton.title = "Apply"
+        applyButton.isBordered = false
+        applyButton.wantsLayer = true
+        applyButton.layer?.cornerRadius = 8
+        applyButton.layer?.backgroundColor = NSColor.systemBlue.cgColor
+        applyButton.contentTintColor = .white
+        applyButton.font = .systemFont(ofSize: 12, weight: .semibold)
+        applyButton.target = self
+        applyButton.action = #selector(applyPressed)
+        NSLayoutConstraint.activate([
+            applyButton.widthAnchor.constraint(equalToConstant: 76),
+            applyButton.heightAnchor.constraint(equalToConstant: 30)
+        ])
+
+        let cancelButton = NSButton()
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        cancelButton.title = "Cancel"
+        cancelButton.isBordered = false
+        cancelButton.wantsLayer = true
+        cancelButton.layer?.cornerRadius = 8
+        cancelButton.layer?.backgroundColor = NSColor(calibratedWhite: 0.28, alpha: 1).cgColor
+        cancelButton.contentTintColor = .white
+        cancelButton.font = .systemFont(ofSize: 12, weight: .medium)
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelPressed)
+        NSLayoutConstraint.activate([
+            cancelButton.widthAnchor.constraint(equalToConstant: 76),
+            cancelButton.heightAnchor.constraint(equalToConstant: 30)
+        ])
+
+        addSubview(styleStack)
+        addSubview(cancelButton)
+        addSubview(applyButton)
+        NSLayoutConstraint.activate([
+            styleStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            styleStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            applyButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            applyButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            cancelButton.trailingAnchor.constraint(equalTo: applyButton.leadingAnchor, constant: -8),
+            cancelButton.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    private var selectedStyle: RedactionStyle {
+        styleSelector.selectedSegment == 0 ? .blur : .solidBlack
+    }
+
+    @objc private func applyPressed() {
+        onApply?(selectedStyle)
+    }
+
+    @objc private func cancelPressed() {
+        onCancel?()
+    }
+
+    @objc private func styleChanged() {}
 }

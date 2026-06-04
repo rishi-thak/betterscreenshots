@@ -14,12 +14,6 @@ struct CaptureResult {
 final class CaptureManager {
     private let configuration: ScreenshotConfiguration
     private let fileManager = FileManager.default
-    private let formatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd 'at' h.mm.ss a"
-        return formatter
-    }()
 
     init(configuration: ScreenshotConfiguration) {
         self.configuration = configuration
@@ -84,8 +78,19 @@ final class CaptureManager {
     }
 
     private func capture(rect: CGRect, anchorPoint: CGPoint, isWindowCapture: Bool) -> CaptureResult? {
+        // CGWindowListCreateImage uses Quartz coordinates (top-left origin, Y down).
+        // The incoming rect is in AppKit screen coordinates (bottom-left origin, Y up).
+        // Flip Y: quartzY = primaryScreenHeight - (appKitY + height)
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        let quartzRect = CGRect(
+            x: rect.origin.x,
+            y: primaryHeight - rect.origin.y - rect.height,
+            width: rect.width,
+            height: rect.height
+        ).integral
+
         guard let cgImage = CGWindowListCreateImage(
-            rect,
+            quartzRect,
             .optionOnScreenOnly,
             kCGNullWindowID,
             [.bestResolution, .boundsIgnoreFraming]
@@ -153,10 +158,14 @@ final class CaptureManager {
             return nil
         }
 
-        let timestamp = formatter.string(from: Date())
-        let baseName = "Screenshot \(timestamp)"
+        let baseName = CaptureNaming.baseName(date: Date())
         let fileExtension = configuration.outputExtension
-        let fileURL = uniqueFileURL(baseName: baseName, fileExtension: fileExtension)
+        let fileURL = CaptureNaming.uniqueFileURL(
+            baseName: baseName,
+            fileExtension: fileExtension,
+            directoryURL: configuration.directoryURL,
+            fileExists: fileManager.fileExists(atPath:)
+        )
 
         guard let destination = CGImageDestinationCreateWithURL(
             fileURL as CFURL,
@@ -173,18 +182,5 @@ final class CaptureManager {
         }
 
         return ScreenshotFile(id: fileURL.path, url: fileURL, createdAt: Date())
-    }
-
-    private func uniqueFileURL(baseName: String, fileExtension: String) -> URL {
-        var index = 0
-
-        while true {
-            let suffix = index == 0 ? "" : " \(index)"
-            let fileURL = configuration.directoryURL.appendingPathComponent("\(baseName)\(suffix).\(fileExtension)")
-            if !fileManager.fileExists(atPath: fileURL.path) {
-                return fileURL
-            }
-            index += 1
-        }
     }
 }

@@ -37,6 +37,8 @@ cat > "$AGENT_PLIST" <<EOF
 EOF
 
 launchctl unload "$AGENT_PLIST" >/dev/null 2>&1 || true
+pkill -9 -x ssclipboard 2>/dev/null || true
+sleep 1
 launchctl load "$AGENT_PLIST"
 
 echo "Installed $TARGET_APP"

@@ -14,6 +14,8 @@ let package = Package(
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("Carbon"),
                 .linkedFramework("ImageIO"),
+                .linkedFramework("Vision"),
+                .linkedFramework("CoreImage"),
                 .linkedFramework("UniformTypeIdentifiers")
             ]
         ),

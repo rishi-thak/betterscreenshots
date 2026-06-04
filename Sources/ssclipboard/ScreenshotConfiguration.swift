@@ -6,6 +6,7 @@ struct ScreenshotConfiguration {
     let allowedExtensions: Set<String>
     let outputExtension: String
     let outputUTType: UTType
+    let overlayDurationSeconds: TimeInterval
 
     static func current() -> ScreenshotConfiguration {
         let defaults = UserDefaults(suiteName: "com.apple.screencapture")
@@ -27,7 +28,8 @@ struct ScreenshotConfiguration {
             directoryURL: directoryURL,
             allowedExtensions: allowedExtensions,
             outputExtension: outputInfo.0,
-            outputUTType: outputInfo.1
+            outputUTType: outputInfo.1,
+            overlayDurationSeconds: AppSettings.shared.overlayDurationSeconds
         )
     }
 

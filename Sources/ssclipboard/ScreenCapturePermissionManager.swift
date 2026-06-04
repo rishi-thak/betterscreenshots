@@ -4,7 +4,7 @@ import Foundation
 
 @MainActor
 final class ScreenCapturePermissionManager {
-    enum State {
+    enum State: Equatable {
         case authorized
         case pendingRestart
         case denied
@@ -20,6 +20,7 @@ final class ScreenCapturePermissionManager {
     func requestIfNeededAtLaunch() -> State {
         if cachedAuthorized || CGPreflightScreenCaptureAccess() {
             cachedAuthorized = true
+            SSCLog.permissions.debug("screen capture permission already authorized")
             return .authorized
         }
 
@@ -33,9 +34,11 @@ final class ScreenCapturePermissionManager {
         if granted {
             cachedAuthorized = true
             defaults.set(false, forKey: DefaultsKey.hasRequestedPermission)
+            SSCLog.permissions.info("screen capture permission granted after request")
             return .authorized
         }
 
+        SSCLog.permissions.warning("screen capture permission pending restart")
         return .pendingRestart
     }
 
@@ -46,6 +49,7 @@ final class ScreenCapturePermissionManager {
             return .authorized
         }
 
+        SSCLog.permissions.debug("screen capture permission currently denied")
         return .denied
     }
 }

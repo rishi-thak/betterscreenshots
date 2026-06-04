@@ -182,22 +182,15 @@ private final class SelectionOverlayView: NSView {
 
     func toggleScrollMode() {
         guard let wid = snapWindowID, dragStart == nil else { return }
-        if !scrollMode {
-            // First Space: start recording
-            scrollMode = true
-            needsDisplay = true
-            // Emit immediately with scroll mode — no click needed
-            let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
-            guard let sr = snapRect else { return }
-            let globalRect = CGRect(
-                x: sr.origin.x + panelOrigin.x,
-                y: sr.origin.y + panelOrigin.y,
-                width: sr.width,
-                height: sr.height
-            )
-            onComplete?(RegionResult(rect: globalRect, windowID: wid, scrollMode: true))
+        guard !scrollMode else { return }
+        scrollMode = true
+        needsDisplay = true
+        guard let sr = snapRect else {
+            onComplete?(nil)
+            return
         }
-        // Second Space is handled by ScreenshotAgent's tap interceptor to stop recording
+        let globalRect = CoordinateConversion.localRectToGlobal(sr, panelOrigin: panelOrigin)
+        onComplete?(RegionResult(rect: globalRect, windowID: wid, scrollMode: true))
     }
 
     override func updateTrackingAreas() {
@@ -217,19 +210,17 @@ private final class SelectionOverlayView: NSView {
 
         // Convert view point to global screen coordinates (Quartz/CG origin = bottom-left of primary screen)
         let screenPt = CGPoint(x: viewPt.x + panelOrigin.x, y: viewPt.y + panelOrigin.y)
-        // CG uses top-left origin; convert
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
-        let cgPt = CGPoint(x: screenPt.x, y: primaryHeight - screenPt.y)
+        let cgPt = CoordinateConversion.appKitPointToQuartz(screenPt, primaryScreenHeight: primaryHeight)
 
         if let win = frontmostWindowInfo(at: cgPt) {
             if win.id != snapWindowID { scrollMode = false }
             snapWindowID = win.id
             // Convert CG rect (top-left origin) back to view coordinates
-            let winRectNS = CGRect(
-                x: win.rect.origin.x - panelOrigin.x,
-                y: primaryHeight - win.rect.origin.y - win.rect.height - panelOrigin.y,
-                width: win.rect.width,
-                height: win.rect.height
+            let winRectNS = CoordinateConversion.quartzWindowRectToPanelLocal(
+                win.rect,
+                panelOrigin: panelOrigin,
+                primaryScreenHeight: primaryHeight
             )
             snapRect = winRectNS
         } else {
@@ -320,30 +311,23 @@ private final class SelectionOverlayView: NSView {
             // Treat as window snap click — re-query window under cursor
             let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
             let screenPt = CGPoint(x: upPoint.x + panelOrigin.x, y: upPoint.y + panelOrigin.y)
-            let cgPt = CGPoint(x: screenPt.x, y: primaryHeight - screenPt.y)
+            let cgPt = CoordinateConversion.appKitPointToQuartz(screenPt, primaryScreenHeight: primaryHeight)
 
             if let win = frontmostWindowInfo(at: cgPt) {
-                let globalRect = CGRect(
-                    x: win.rect.origin.x,
-                    y: primaryHeight - win.rect.origin.y - win.rect.height,
-                    width: win.rect.width,
-                    height: win.rect.height
+                let globalRect = CoordinateConversion.quartzWindowRectToAppKitGlobal(
+                    win.rect,
+                    primaryScreenHeight: primaryHeight
                 )
-                NSLog("SSC: mouseUp snap windowID=%u scrollMode=%d", win.id, scrollMode ? 1 : 0)
+                SSCLog.selection.info("mouseUp snap windowID=\(win.id, privacy: .public) scrollMode=\(self.scrollMode, privacy: .public)")
                 onComplete?(RegionResult(rect: globalRect, windowID: win.id, scrollMode: scrollMode))
             } else {
-                NSLog("SSC: mouseUp snap — no window found")
+                SSCLog.selection.debug("mouseUp snap had no window match")
                 onComplete?(nil)
             }
         } else {
             // Normal drag selection — convert to global coordinates
             guard let sel = selectionRect else { onComplete?(nil); return }
-            let globalRect = CGRect(
-                x: sel.origin.x + panelOrigin.x,
-                y: sel.origin.y + panelOrigin.y,
-                width: sel.width,
-                height: sel.height
-            )
+            let globalRect = CoordinateConversion.localRectToGlobal(sel, panelOrigin: panelOrigin)
             onComplete?(RegionResult(rect: globalRect, windowID: nil, scrollMode: false))
         }
         dragStart = nil

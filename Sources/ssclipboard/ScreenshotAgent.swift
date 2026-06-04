@@ -5,9 +5,12 @@ import Foundation
 @MainActor
 final class ScreenshotAgent {
     private let configuration: ScreenshotConfiguration
+    private let appSettings: AppSettings
     private let clipboardWriter = ClipboardWriter()
     private let accessibilityPermissionManager = AccessibilityPermissionManager()
     private let permissionManager = ScreenCapturePermissionManager()
+    private let permissionStatusController = PermissionStatusController()
+    private var hotKeysStarted = false
     private lazy var captureManager = CaptureManager(configuration: configuration)
     private let regionSelectionController = RegionSelectionController()
     private let scrollingCaptureController = ScrollingCaptureController()
@@ -18,6 +21,7 @@ final class ScreenshotAgent {
         }
     )
     private lazy var overlayController = ActionOverlayController(
+        appSettings: appSettings,
         onDelete: { [weak self] screenshot in
             self?.handleDeletedScreenshot(screenshot)
         },
@@ -34,23 +38,36 @@ final class ScreenshotAgent {
         }
     )
 
-    init(configuration: ScreenshotConfiguration = ScreenshotConfiguration.current()) {
+    init(configuration: ScreenshotConfiguration = ScreenshotConfiguration.current(), appSettings: AppSettings = .shared) {
         self.configuration = configuration
+        self.appSettings = appSettings
     }
 
     func start() {
-        handlePermissionState(permissionManager.requestIfNeededAtLaunch())
-        _ = accessibilityPermissionManager.requestAtLaunch()
-        pollAccessibility()
+        SSCLog.app.info("starting screenshot agent")
+        let screenCaptureState = permissionManager.requestIfNeededAtLaunch()
+        let accessibilityState = accessibilityPermissionManager.requestAtLaunch()
+
+        handlePermissionState(screenCaptureState)
+        handleAccessibilityState(accessibilityState)
+
+        updatePermissionStatus(screenCaptureState: screenCaptureState, accessibilityState: accessibilityState)
+        pollPermissionHealth()
     }
 
-    private func pollAccessibility() {
-        if AXIsProcessTrusted() {
-            hotKeyManager.start()
+    private func pollPermissionHealth() {
+        let accessibilityState = accessibilityPermissionManager.currentState()
+        let screenCaptureState = permissionManager.currentState()
+
+        handleAccessibilityState(accessibilityState)
+        updatePermissionStatus(screenCaptureState: screenCaptureState, accessibilityState: accessibilityState)
+
+        if accessibilityState == .authorized, screenCaptureState == .authorized {
             return
         }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            self?.pollAccessibility()
+            self?.pollPermissionHealth()
         }
     }
 
@@ -61,6 +78,11 @@ final class ScreenshotAgent {
         }
 
         guard let result = captureManager.captureFullScreen() else {
+            if permissionManager.currentState() != .authorized {
+                handleUnauthorizedCaptureAttempt()
+                return
+            }
+            SSCLog.capture.error("fullscreen capture returned no result")
             NSSound.beep()
             return
         }
@@ -79,7 +101,7 @@ final class ScreenshotAgent {
             self.hotKeyManager.keyInterceptor = nil
             guard let result else { return }
             if result.scrollMode, let windowID = result.windowID {
-                NSLog("SSC: entering scroll mode, windowID=%u", windowID)
+                SSCLog.scroll.info("entering scroll mode, windowID=\(windowID, privacy: .public)")
                 // Show recording HUD
                 self.showScrollRecordingHUD()
                 // Route Space/Escape through the tap to stop capture
@@ -97,7 +119,9 @@ final class ScreenshotAgent {
                     self.hideScrollRecordingHUD()
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     guard let saved = self.captureManager.saveScrollCapture(cgImage) else { return }
-                    _ = self.clipboardWriter.copyImage(nsImage)
+                    if self.appSettings.copyToClipboardEnabled {
+                        _ = self.clipboardWriter.copyImage(nsImage)
+                    }
                     self.overlayController.present(for: saved.screenshot, previewImage: nsImage, on: NSScreen.main, isWindowCapture: false)
                 }
                 self.scrollingCaptureController.begin(windowID: windowID)
@@ -110,7 +134,12 @@ final class ScreenshotAgent {
             } else {
                 captureResult = self.captureManager.captureRegion(result.rect)
             }
-            guard let captureResult else { return }
+            guard let captureResult else {
+                if self.permissionManager.currentState() != .authorized {
+                    self.handleUnauthorizedCaptureAttempt()
+                }
+                return
+            }
             self.handleCapture(captureResult)
         }
         // Panel is now open — install the tap-level key suppressor
@@ -118,7 +147,9 @@ final class ScreenshotAgent {
     }
 
     private func handleCapture(_ result: CaptureResult) {
-        _ = clipboardWriter.copyImage(result.image)
+        if appSettings.copyToClipboardEnabled {
+            _ = clipboardWriter.copyImage(result.image)
+        }
         overlayController.present(for: result.screenshot, previewImage: result.image, on: result.anchorScreen, isWindowCapture: result.isWindowCapture)
     }
 
@@ -195,14 +226,33 @@ final class ScreenshotAgent {
     private func handleAccessibilityState(_ state: AccessibilityPermissionManager.State) {
         switch state {
         case .authorized:
+            guard !hotKeysStarted else { return }
             hotKeyManager.start()
+            hotKeysStarted = true
         case .denied:
+            guard hotKeysStarted else { return }
+            hotKeyManager.stop()
+            hotKeysStarted = false
             return
         }
     }
 
     private func handleUnauthorizedCaptureAttempt() {
-        NSSound.beep()
+        permissionStatusController.showCaptureBlockedAlert()
+        updatePermissionStatus(
+            screenCaptureState: permissionManager.currentState(),
+            accessibilityState: accessibilityPermissionManager.currentState()
+        )
+    }
+
+    private func updatePermissionStatus(
+        screenCaptureState: ScreenCapturePermissionManager.State,
+        accessibilityState: AccessibilityPermissionManager.State
+    ) {
+        permissionStatusController.update(
+            screenCaptureAuthorized: screenCaptureState == .authorized,
+            accessibilityAuthorized: accessibilityState == .authorized
+        )
     }
 
     private func scheduleAgentRestart() {

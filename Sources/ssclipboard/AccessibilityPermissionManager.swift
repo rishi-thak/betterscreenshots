@@ -3,7 +3,7 @@ import Foundation
 
 @MainActor
 final class AccessibilityPermissionManager {
-    enum State {
+    enum State: Equatable {
         case authorized
         case denied
     }
@@ -11,10 +11,12 @@ final class AccessibilityPermissionManager {
     func requestAtLaunch() -> State {
         let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(options)
+        SSCLog.permissions.debug("accessibility request state=\(trusted, privacy: .public)")
         return trusted ? .authorized : .denied
     }
 
     func currentState() -> State {
-        AXIsProcessTrusted() ? .authorized : .denied
+        let trusted = AXIsProcessTrusted()
+        return trusted ? .authorized : .denied
     }
 }
