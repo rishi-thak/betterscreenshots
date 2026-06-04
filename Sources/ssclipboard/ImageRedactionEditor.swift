@@ -162,20 +162,23 @@ enum ImageRedactionApplier {
     }
 
     private static func applySolidRedaction(cgImage: CGImage, regions: [CGRect]) -> NSImage? {
-        guard let colorSpace = cgImage.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width > 0, height > 0,
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
               let context = CGContext(
                   data: nil,
-                  width: cgImage.width,
-                  height: cgImage.height,
-                  bitsPerComponent: cgImage.bitsPerComponent,
-                  bytesPerRow: 0,
+                  width: width,
+                  height: height,
+                  bitsPerComponent: 8,
+                  bytesPerRow: width * 4,
                   space: colorSpace,
-                  bitmapInfo: cgImage.bitmapInfo.rawValue
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               ) else {
             return nil
         }
 
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         context.setFillColor(NSColor.black.cgColor)
         for rect in regions {
             context.fill(rect)

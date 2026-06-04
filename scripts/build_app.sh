@@ -21,7 +21,12 @@ cp "$BUILD_DIR/ssclipboard" "$MACOS_DIR/ssclipboard"
 chmod +x "$MACOS_DIR/ssclipboard"
 
 if [[ -n "$SIGNING_IDENTITY" ]] && command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign "$SIGNING_IDENTITY" --options runtime --timestamp "$APP_DIR"
+  ENTITLEMENTS="$ROOT_DIR/App/SSClipboard.entitlements"
+  if [[ -f "$ENTITLEMENTS" ]]; then
+    codesign --force --sign "$SIGNING_IDENTITY" --options runtime --timestamp --entitlements "$ENTITLEMENTS" "$APP_DIR"
+  else
+    codesign --force --sign "$SIGNING_IDENTITY" --options runtime --timestamp "$APP_DIR"
+  fi
 fi
 
 echo "$APP_DIR"

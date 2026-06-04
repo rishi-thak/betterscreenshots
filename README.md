@@ -18,7 +18,7 @@ macOS screenshots are fast, but the default flow still adds friction: mentally t
 |------|-------------------|
 | **Global input** | `CGEvent.tapCreate` at `.cgSessionEventTap` / `.headInsertEventTap` on thread `com.rishi.ssclipboard.eventtap` with its own `CFRunLoop` — tap callbacks never block the main run loop |
 | **Swift 6 concurrency** | `swiftLanguageModes: [.v6]`; capture orchestration and AppKit UI on `@MainActor`; `HotKeyManager` is `@unchecked Sendable` with `@Sendable` closures across threads |
-| **Scroll stitching** | `ScrollingCaptureController` samples `CGWindowListCreateImage` on a 0.4s timer, deduplicates static frames via strided row comparison, then **`findOverlap`** matches bottom rows of frame *n* to top rows of *n+1* and composites unique strips into one bitmap |
+| **Scroll stitching** | `ScrollingCaptureController` samples `CGWindowListCreateImage` on a ~0.18s timer and drops paused (duplicate) frames; `ScrollingStitcher` detects the non-scrolling top/bottom **chrome bands**, aligns only the middle **content band** across frames via full-width row correlation (handles up- and down-scroll), then composes chrome-once + stitched content into one bitmap |
 | **Multi-display** | Full-screen path unions `NSScreen` frames and blits each display via `CGDisplayCreateImage` onto one canvas |
 | **Coordinate systems** | AppKit (bottom-left) ↔ Quartz (top-left) Y-flip for overlay drawing, window hit-testing, and `CGWindowListCreateImage` rects |
 | **Window polish** | Layer-0 hit test via `CGWindowListCopyWindowInfo`; 12pt rounded-corner alpha mask on window captures |
@@ -32,7 +32,7 @@ macOS screenshots are fast, but the default flow still adds friction: mentally t
 - **Instant clipboard** — every successful capture is written to `NSPasteboard` before the user moves on (`ClipboardWriter`)
 - **Full-screen (`Cmd+Shift+3`)** — composites all displays onto one `CGImage`
 - **Region / window (`Cmd+Shift+4`)** — borderless multi-display overlay (`.screenSaver` level); software crosshair; hover to snap a window (blue highlight); drag for manual region; AppKit ↔ Quartz coordinate conversion
-- **Scrolling capture** — snap a window, **Space** to start scroll recording, scroll the target content, **Space** to stop; frames are stitched into one tall image, then saved and copied
+- **Scrolling capture** — snap a window, **Space** to start scroll recording, scroll the target content (Space/page-down works in the target app), **Return** or **Esc** to stop; frames are stitched into one tall image, then saved and copied
 - **Native save location** — reads `com.apple.screencapture` for folder and format (PNG / JPEG / TIFF / HEIC, etc.) via `ScreenshotConfiguration`
 - **Transient action overlay** — bottom-right panel (default ~6s, configurable via `AppSettings`) with Share, Delete, and draggable preview; click preview to open the viewer
 - **Full-screen viewer** — zoom, copy, share, reveal in Finder, delete; window captures expose a **background editor** (gradient / solid, padding, aspect presets 1:1, 4:3, 16:9, 3:2)
@@ -48,10 +48,10 @@ macOS screenshots are fast, but the default flow still adds friction: mentally t
 | 1 | `Cmd+Shift+4` — region overlay appears across all displays |
 | 2 | Move over a scrollable window until it highlights (**blue**); click for a normal window shot, or press **Space** while snapped to enter scroll mode (**green**) and start recording |
 | 3 | Scroll the window content; frames sample on a timer while pixels change (static frames are skipped) |
-| 4 | **Space** — stop recording, stitch overlaps, save, copy to clipboard, show action overlay |
+| 4 | **Return** or **Esc** — stop recording, stitch overlaps, save, copy to clipboard, show action overlay |
 | — | **Escape** — cancel during region selection; also ends scroll recording (handled by the same global key interceptor) |
 
-A HUD (*Recording — Space to stop*) appears in the bottom-right while scroll capture is active.
+A HUD (*Recording — Return or Esc to stop*) appears in the bottom-right while scroll capture is active.
 
 > **Tip:** Rebind or disable macOS’s built-in screenshot shortcuts so SSClipboard can own `Cmd+Shift+3/4`: **System Settings → Keyboard → Keyboard Shortcuts → Screenshots**.
 
@@ -142,7 +142,7 @@ Sources/ssclipboard/
 
 **`CaptureManager`** — `captureFullScreen()` unions screen frames and blits each display; `captureRegion` / `captureWindow` use `CGWindowListCreateImage` with appropriate option sets; window captures get a **12pt** rounded clip path; scroll results go through `saveScrollCapture`.
 
-**`ScrollingCaptureController`** — Samples the target `CGWindowID` every **0.4s**, skips duplicate frames via strided `UInt32` row comparison (`imagesLookSame`), then stitches by extracting per-row buffers, running **`findOverlap`** (bottom of *prev* vs top of *curr*, tolerance `0x0A0A0A` per channel stride), and drawing cropped unique strips bottom-up in a single `CGContext`.
+**`ScrollingCaptureController`** — Samples the target `CGWindowID` every **~0.18s** (bounded at 800 stored frames), skipping frames recorded while the content is unchanged (`ScrollingStitcher.framesAreDuplicate`, a strided whole-frame `UInt32` comparison). **`ScrollingStitcher`** then: (1) detects the static **chrome bands** — the longest top/bottom row prefixes/suffixes that are identical across every captured frame, i.e. the title bar/toolbar and footer that don't scroll; (2) for each consecutive pair, finds the vertical displacement of the **content band** by minimizing average per-channel row difference over the full overlap (`bandDisplacement`, searching both scroll directions); (3) composes top chrome + the stitched content band + bottom chrome into a single tall bitmap. This fixes the prior `findOverlap` approach, which matched the toolbar of frame *n+1* against the content of frame *n* and so found no overlap — stacking whole frames instead of stitching them.
 
 **`RegionSelectionController`** — Borderless `NSPanel` spanning all displays; software crosshair; window highlight **blue → green** in scroll mode; `CGWindowListCopyWindowInfo` layer-0 hit test; integrates with the event tap for Escape/Space during selection.
 

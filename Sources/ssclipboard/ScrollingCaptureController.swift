@@ -9,6 +9,13 @@ import Foundation
 final class ScrollingCaptureController: NSObject {
     var onComplete: ((CGImage) -> Void)?
 
+    // Dense sampling gives consecutive frames a large overlap, which is what
+    // makes the stitch alignment reliable.
+    private static let captureInterval: TimeInterval = 0.18
+    // Upper bound on stored (deduplicated) frames so a long recording can't grow
+    // memory without limit.
+    private static let maxFrames = 200
+
     private var captureTimer: Timer?
     private var frames: [CGImage] = []
     private var targetWindowID: CGWindowID?
@@ -21,7 +28,7 @@ final class ScrollingCaptureController: NSObject {
 
     private func startCapturing() {
         captureFrame()  // capture first frame immediately
-        captureTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+        captureTimer = Timer.scheduledTimer(withTimeInterval: Self.captureInterval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.captureFrame() }
         }
     }
@@ -31,12 +38,14 @@ final class ScrollingCaptureController: NSObject {
             SSCLog.scroll.warning("captureFrame skipped: missing window id")
             return
         }
+        guard frames.count < Self.maxFrames else { return }
         guard let img = CGWindowListCreateImage(.null, .optionIncludingWindow, wid,
                                                 [.bestResolution, .boundsIgnoreFraming]) else {
             SSCLog.scroll.error("captureFrame failed: CGWindowListCreateImage returned nil")
             return
         }
-        if let last = frames.last, ScrollingStitcher.imagesLookSame(last, img) { return }
+        // Skip frames recorded while the window content is unchanged (paused).
+        if let last = frames.last, ScrollingStitcher.framesAreDuplicate(last, img) { return }
         frames.append(img)
         SSCLog.scroll.debug("captured frame \(self.frames.count, privacy: .public) (\(img.width, privacy: .public)x\(img.height, privacy: .public))")
     }

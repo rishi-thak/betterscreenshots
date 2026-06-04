@@ -41,6 +41,9 @@ struct ScreenshotConfiguration {
             return ("tiff", .tiff)
         case "heic":
             return ("heic", .heic)
+        case "pdf":
+            // CGImageDestination does not reliably encode a single raster image as PDF; use PNG.
+            return ("png", .png)
         default:
             return ("png", .png)
         }

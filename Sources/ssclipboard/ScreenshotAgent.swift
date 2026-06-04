@@ -59,14 +59,13 @@ final class ScreenshotAgent {
         let accessibilityState = accessibilityPermissionManager.currentState()
         let screenCaptureState = permissionManager.currentState()
 
+        handlePermissionState(screenCaptureState)
         handleAccessibilityState(accessibilityState)
         updatePermissionStatus(screenCaptureState: screenCaptureState, accessibilityState: accessibilityState)
 
-        if accessibilityState == .authorized, screenCaptureState == .authorized {
-            return
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        let interval: TimeInterval =
+            (accessibilityState == .authorized && screenCaptureState == .authorized) ? 5.0 : 1.0
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval) { [weak self] in
             self?.pollPermissionHealth()
         }
     }
@@ -104,10 +103,10 @@ final class ScreenshotAgent {
                 SSCLog.scroll.info("entering scroll mode, windowID=\(windowID, privacy: .public)")
                 // Show recording HUD
                 self.showScrollRecordingHUD()
-                // Route Space/Escape through the tap to stop capture
+                // Return/Escape stop capture; Space is left for the target app (page-down scroll).
                 self.hotKeyManager.keyInterceptor = { [weak self] event in
                     let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-                    if keyCode == Int64(kVK_Space) || keyCode == Int64(kVK_Escape) {
+                    if keyCode == Int64(kVK_Return) || keyCode == Int64(kVK_Escape) {
                         DispatchQueue.main.async { self?.scrollingCaptureController.stop() }
                         return true
                     }
@@ -157,7 +156,7 @@ final class ScreenshotAgent {
 
     private func showScrollRecordingHUD() {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 220, height: 36),
+            contentRect: NSRect(x: 0, y: 0, width: 290, height: 36),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
@@ -168,7 +167,7 @@ final class ScreenshotAgent {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 36))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 290, height: 36))
         container.wantsLayer = true
         container.layer?.cornerRadius = 10
         container.layer?.backgroundColor = NSColor(calibratedWhite: 0.1, alpha: 0.92).cgColor
@@ -183,8 +182,8 @@ final class ScreenshotAgent {
         pulse.duration = 0.8; pulse.autoreverses = true; pulse.repeatCount = .infinity
         dot.layer?.add(pulse, forKey: "pulse")
 
-        let label = NSTextField(labelWithString: "Recording — Space to stop")
-        label.frame = NSRect(x: 34, y: 9, width: 178, height: 18)
+        let label = NSTextField(labelWithString: "Recording — Return or Esc to stop")
+        label.frame = NSRect(x: 34, y: 9, width: 248, height: 18)
         label.font = .systemFont(ofSize: 12, weight: .medium)
         label.textColor = .white
 

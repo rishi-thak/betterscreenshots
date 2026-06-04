@@ -17,6 +17,8 @@ final class HotKeyManager: @unchecked Sendable {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var tapThread: Thread?
+    private var tapRunLoop: CFRunLoop?
+    private let tapLock = NSLock()
 
     // Optional interceptor set by RegionSelectionController while overlay is active.
     // Must be thread-safe: written on main, read on tap thread.
@@ -52,16 +54,31 @@ final class HotKeyManager: @unchecked Sendable {
         ) else { return }
 
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        let runLoopReady = DispatchSemaphore(value: 0)
 
         // Run the tap on a dedicated background thread — never blocks the main thread.
-        let thread = Thread {
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        let thread = Thread { [weak self] in
+            guard let self else { return }
+            let runLoop = CFRunLoopGetCurrent()
+            self.tapLock.lock()
+            self.tapRunLoop = runLoop
+            self.tapLock.unlock()
+            runLoopReady.signal()
+
+            CFRunLoopAddSource(runLoop, source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
             CFRunLoopRun()
+
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            self.tapLock.lock()
+            self.tapRunLoop = nil
+            self.tapLock.unlock()
         }
         thread.name = "com.rishi.ssclipboard.eventtap"
         thread.qualityOfService = .userInteractive
         thread.start()
+
+        _ = runLoopReady.wait(timeout: .now() + 2)
 
         eventTap = tap
         runLoopSource = source
@@ -69,18 +86,48 @@ final class HotKeyManager: @unchecked Sendable {
     }
 
     func stop() {
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
+        tapLock.lock()
+        let tap = eventTap
+        let source = runLoopSource
+        let runLoop = tapRunLoop
+        let thread = tapThread
         eventTap = nil
         runLoopSource = nil
+        tapRunLoop = nil
         tapThread = nil
+        tapLock.unlock()
+
+        if let tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        if let runLoop {
+            CFRunLoopStop(runLoop)
+        }
+        if let thread {
+            let deadline = Date().addingTimeInterval(1)
+            while thread.isExecuting, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+        }
+        if let source, let runLoop {
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+        }
+        if let tap {
+            CFMachPortInvalidate(tap)
+        }
+
         isHandlingShortcut = false
     }
 
     // Called on the tap thread — must never block, never touch @MainActor state.
     private func handle(event: CGEvent, type: CGEventType) -> Unmanaged<CGEvent>? {
+        tapLock.lock()
+        let tap = eventTap
+        tapLock.unlock()
+
         // Re-enable tap if macOS disabled it due to timeout.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
 

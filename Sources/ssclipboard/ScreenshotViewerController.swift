@@ -56,18 +56,6 @@ final class ScreenshotViewerController: NSObject {
         super.init()
         configureWindow()
         configureViews()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(windowDidResignKey),
-            name: NSWindow.didResignKeyNotification,
-            object: window
-        )
-    }
-
-    @objc private func windowDidResignKey() {
-        // Don't close if focus moved to an auxiliary panel (e.g. color picker)
-        if let key = NSApp.keyWindow, key is NSPanel { return }
-        window.orderOut(nil)
     }
 
     func present(screenshot: ScreenshotFile, isWindowCapture: Bool = false) {
@@ -391,11 +379,19 @@ final class ScreenshotViewerController: NSObject {
 
     @objc private func deleteScreenshot() {
         guard let screenshot = currentScreenshot else { return }
-        do {
-            try FileManager.default.removeItem(at: screenshot.url)
-            onDelete(screenshot)
-            window.orderOut(nil)
-        } catch { NSSound.beep() }
+        deleteButton.isEnabled = false
+        NSWorkspace.shared.recycle([screenshot.url]) { [weak self] _, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if error != nil {
+                    NSSound.beep()
+                    self.deleteButton.isEnabled = FileManager.default.fileExists(atPath: screenshot.url.path)
+                    return
+                }
+                self.onDelete(screenshot)
+                self.window.orderOut(nil)
+            }
+        }
     }
 
     @objc private func zoomOut() { setZoomScale(zoomScale - 0.15) }
@@ -762,8 +758,12 @@ private final class BackgroundEditorView: NSView {
         switch selectedBackground {
         case .gradient(let idx):
             let (c1, c2) = Self.gradients[idx]
-            let gradient = NSGradient(starting: c1, ending: c2)!
-            gradient.draw(in: canvasRect, angle: 135)
+            if let gradient = NSGradient(starting: c1, ending: c2) {
+                gradient.draw(in: canvasRect, angle: 135)
+            } else {
+                c1.setFill()
+                canvasRect.fill()
+            }
         case .solid(let color):
             color.setFill()
             canvasRect.fill()
@@ -806,8 +806,12 @@ private final class GradientSwatchButton: NSButton {
     required init?(coder: NSCoder) { fatalError() }
 
     override func draw(_ dirtyRect: NSRect) {
-        let gradient = NSGradient(starting: fromColor, ending: toColor)!
-        gradient.draw(in: bounds, angle: 135)
+        if let gradient = NSGradient(starting: fromColor, ending: toColor) {
+            gradient.draw(in: bounds, angle: 135)
+        } else {
+            fromColor.setFill()
+            bounds.fill()
+        }
     }
 }
 

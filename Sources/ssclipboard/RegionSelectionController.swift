@@ -248,7 +248,7 @@ private final class SelectionOverlayView: NSView {
             path.stroke()
 
             // Hint label
-            let label = scrollMode ? "Recording — Space to stop" : "Space to record scroll"
+            let label = scrollMode ? "Recording — Return or Esc to stop" : "Space to record scroll"
             let attrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 12, weight: .medium),
                 .foregroundColor: NSColor.white

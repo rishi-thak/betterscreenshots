@@ -56,9 +56,17 @@ final class CaptureManager {
             [.bestResolution, .boundsIgnoreFraming]
         ) else { return nil }
 
-        let masked = roundedMask(cgImage, radius: 12)
-        let image = NSImage(cgImage: masked ?? cgImage, size: NSSize(width: (masked ?? cgImage).width, height: (masked ?? cgImage).height))
-        guard let screenshot = save(cgImage: masked ?? cgImage) else { return nil }
+        // JPEG has no alpha; rounded corners would flatten to black without a matte.
+        let outputImage: CGImage
+        if configuration.outputUTType == .jpeg {
+            outputImage = cgImage
+        } else if let masked = roundedMask(cgImage, radius: 12) {
+            outputImage = masked
+        } else {
+            outputImage = cgImage
+        }
+        let image = NSImage(cgImage: outputImage, size: NSSize(width: outputImage.width, height: outputImage.height))
+        guard let screenshot = save(cgImage: outputImage) else { return nil }
 
         let anchorScreen = NSScreen.screens.first(where: { $0.frame.contains(CGPoint(x: rect.midX, y: rect.midY)) })
         return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen, isWindowCapture: true)
@@ -110,8 +118,15 @@ final class CaptureManager {
     }
 
     private func makeCompositeImage(for screens: [NSScreen], canvasRect: CGRect) -> CGImage? {
-        let width = Int(canvasRect.width.rounded(.up))
-        let height = Int(canvasRect.height.rounded(.up))
+        // NSScreen.frame is in points; CGDisplayCreateImage is native pixels (see captureRegion + bestResolution).
+        var width = 0
+        var height = 0
+        for screen in screens {
+            let scale = screen.backingScaleFactor
+            let frame = screen.frame
+            width = max(width, Int(((frame.maxX - canvasRect.minX) * scale).rounded(.up)))
+            height = max(height, Int(((frame.maxY - canvasRect.minY) * scale).rounded(.up)))
+        }
 
         guard width > 0,
               height > 0,
@@ -137,12 +152,13 @@ final class CaptureManager {
                 continue
             }
 
+            let scale = screen.backingScaleFactor
             let frame = screen.frame
             let drawRect = CGRect(
-                x: frame.minX - canvasRect.minX,
-                y: frame.minY - canvasRect.minY,
-                width: frame.width,
-                height: frame.height
+                x: (frame.minX - canvasRect.minX) * scale,
+                y: (frame.minY - canvasRect.minY) * scale,
+                width: CGFloat(displayImage.width),
+                height: CGFloat(displayImage.height)
             )
 
             context.draw(displayImage, in: drawRect)

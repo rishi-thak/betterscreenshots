@@ -15,11 +15,9 @@ final class ScreenCapturePermissionManager {
     }
 
     private let defaults = UserDefaults.standard
-    private var cachedAuthorized = false
 
     func requestIfNeededAtLaunch() -> State {
-        if cachedAuthorized || CGPreflightScreenCaptureAccess() {
-            cachedAuthorized = true
+        if CGPreflightScreenCaptureAccess() {
             SSCLog.permissions.debug("screen capture permission already authorized")
             return .authorized
         }
@@ -32,7 +30,6 @@ final class ScreenCapturePermissionManager {
         defaults.set(true, forKey: DefaultsKey.hasRequestedPermission)
         let granted = CGRequestScreenCaptureAccess()
         if granted {
-            cachedAuthorized = true
             defaults.set(false, forKey: DefaultsKey.hasRequestedPermission)
             SSCLog.permissions.info("screen capture permission granted after request")
             return .authorized
@@ -43,8 +40,7 @@ final class ScreenCapturePermissionManager {
     }
 
     func currentState() -> State {
-        if cachedAuthorized || CGPreflightScreenCaptureAccess() {
-            cachedAuthorized = true
+        if CGPreflightScreenCaptureAccess() {
             defaults.set(false, forKey: DefaultsKey.hasRequestedPermission)
             return .authorized
         }
