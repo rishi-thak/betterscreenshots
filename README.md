@@ -19,7 +19,7 @@ macOS screenshots are fast, but the default flow still adds friction: mentally t
 | **Global input** | `CGEvent.tapCreate` at `.cgSessionEventTap` / `.headInsertEventTap` on thread `com.rishi.ssclipboard.eventtap` with its own `CFRunLoop` — tap callbacks never block the main run loop |
 | **Swift 6 concurrency** | `swiftLanguageModes: [.v6]`; capture orchestration and AppKit UI on `@MainActor`; `HotKeyManager` is `@unchecked Sendable` with `@Sendable` closures across threads |
 | **Scroll stitching** | `ScrollingCaptureController` samples `CGWindowListCreateImage` on a ~0.18s timer and drops paused (duplicate) frames; `ScrollingStitcher` detects the non-scrolling top/bottom **chrome bands**, aligns only the middle **content band** across frames via full-width row correlation (handles up- and down-scroll), then composes chrome-once + stitched content into one bitmap |
-| **Multi-display** | Full-screen path unions `NSScreen` frames and blits each display via `CGDisplayCreateImage` onto one canvas |
+| **Multi-display** | Capture targets the display under the cursor: full-screen grabs that one screen via `CGDisplayCreateImage`; region/window overlay spans every `NSScreen` so selection follows the cursor across displays |
 | **Coordinate systems** | AppKit (bottom-left) ↔ Quartz (top-left) Y-flip for overlay drawing, window hit-testing, and `CGWindowListCreateImage` rects |
 | **Window polish** | Layer-0 hit test via `CGWindowListCopyWindowInfo`; 12pt rounded-corner alpha mask on window captures |
 | **Viewer tools** | `ImageTextRecognizer` — on-device Vision OCR with **Copy Text** in the viewer; `ImageRedactionEditor` — drag regions to blur or solid-fill sensitive areas |
@@ -30,11 +30,11 @@ macOS screenshots are fast, but the default flow still adds friction: mentally t
 ## Features
 
 - **Instant clipboard** — every successful capture is written to `NSPasteboard` before the user moves on (`ClipboardWriter`)
-- **Full-screen (`Cmd+Shift+3`)** — composites all displays onto one `CGImage`
+- **Full-screen (`Cmd+Shift+3`)** — captures the display the cursor is on via `CGDisplayCreateImage`
 - **Region / window (`Cmd+Shift+4`)** — borderless multi-display overlay (`.screenSaver` level); software crosshair; hover to snap a window (blue highlight); drag for manual region; AppKit ↔ Quartz coordinate conversion
 - **Scrolling capture** — snap a window, **Space** to start scroll recording, scroll the target content (Space/page-down works in the target app), **Return** or **Esc** to stop; frames are stitched into one tall image, then saved and copied
 - **Native save location** — reads `com.apple.screencapture` for folder and format (PNG / JPEG / TIFF / HEIC, etc.) via `ScreenshotConfiguration`
-- **Transient action overlay** — bottom-right panel (default ~6s, configurable via `AppSettings`) with Share, Delete, and draggable preview; click preview to open the viewer
+- **Transient action overlay** — bottom-right panel (default ~6s, configurable via `AppSettings`) with Share, Delete, and draggable preview; click preview to open the viewer. The overlay (and the scroll-recording HUD) is **excluded from new captures** — capture composites the on-screen window list minus this process's own windows, so the card stays visible to you but never leaks into a screenshot
 - **Full-screen viewer** — zoom, copy, share, reveal in Finder, delete; window captures expose a **background editor** (gradient / solid, padding, aspect presets 1:1, 4:3, 16:9, 3:2)
 - **Copy text (OCR)** — viewer toolbar runs `VNRecognizeTextRequest` and copies recognized text to the clipboard
 - **Redact / blur** — drag one or more regions in the viewer; apply Gaussian blur or solid black, then save back to disk
@@ -140,7 +140,7 @@ Sources/ssclipboard/
 
 **`HotKeyManager`** — Installs the session event tap on a **dedicated `Thread`** (`qualityOfService = .userInteractive`), not the main thread. The callback suppresses `Cmd+Shift+3/4` keyDown/keyUp (`return nil`), re-enables the tap on `tapDisabledByTimeout`, and dispatches capture work with `DispatchQueue.main.async`. `keyInterceptor` lets the region overlay and scroll HUD consume **Space** / **Escape** system-wide while active.
 
-**`CaptureManager`** — `captureFullScreen()` unions screen frames and blits each display; `captureRegion` / `captureWindow` use `CGWindowListCreateImage` with appropriate option sets; window captures get a **12pt** rounded clip path; scroll results go through `saveScrollCapture`.
+**`CaptureManager`** — `captureFullScreen()` grabs the display under the cursor with `CGDisplayCreateImage`; `captureRegion` / `captureWindow` use `CGWindowListCreateImage` with appropriate option sets; window captures get a **12pt** rounded clip path; scroll results go through `saveScrollCapture`.
 
 **`ScrollingCaptureController`** — Samples the target `CGWindowID` every **~0.18s** (bounded at 800 stored frames), skipping frames recorded while the content is unchanged (`ScrollingStitcher.framesAreDuplicate`, a strided whole-frame `UInt32` comparison). **`ScrollingStitcher`** then: (1) detects the static **chrome bands** — the longest top/bottom row prefixes/suffixes that are identical across every captured frame, i.e. the title bar/toolbar and footer that don't scroll; (2) for each consecutive pair, finds the vertical displacement of the **content band** by minimizing average per-channel row difference over the full overlap (`bandDisplacement`, searching both scroll directions); (3) composes top chrome + the stitched content band + bottom chrome into a single tall bitmap. This fixes the prior `findOverlap` approach, which matched the toolbar of frame *n+1* against the content of frame *n* and so found no overlap — stacking whole frames instead of stitching them.
 

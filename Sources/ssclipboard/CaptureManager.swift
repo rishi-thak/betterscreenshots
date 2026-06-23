@@ -20,26 +20,30 @@ final class CaptureManager {
     }
 
     func captureFullScreen() -> CaptureResult? {
+        // Capture only the display the cursor is currently on, rather than
+        // compositing every screen. NSEvent.mouseLocation is in global AppKit
+        // coordinates (bottom-left origin); NSScreen.frame uses the same space.
         let screens = NSScreen.screens
-        let captureRect = screens.reduce(CGRect.null) { partialResult, screen in
-            partialResult.union(screen.frame)
-        }
+        let anchorPoint = NSEvent.mouseLocation
+        let targetScreen = screens.first(where: { $0.frame.contains(anchorPoint) })
+            ?? NSScreen.main
+            ?? screens.first
 
-        guard let compositeImage = makeCompositeImage(for: screens, canvasRect: captureRect) else {
+        guard let screen = targetScreen,
+              let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
+              let cgImage = captureExcludingOwnWindows(rect: CGDisplayBounds(displayID)) else {
             return nil
         }
 
         let image = NSImage(
-            cgImage: compositeImage,
-            size: NSSize(width: compositeImage.width, height: compositeImage.height)
+            cgImage: cgImage,
+            size: NSSize(width: cgImage.width, height: cgImage.height)
         )
-        guard let screenshot = save(cgImage: compositeImage) else {
+        guard let screenshot = save(cgImage: cgImage) else {
             return nil
         }
 
-        let anchorPoint = NSEvent.mouseLocation
-        let anchorScreen = screens.first(where: { $0.frame.contains(anchorPoint) })
-        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen, isWindowCapture: false)
+        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: screen, isWindowCapture: false)
     }
 
     func captureRegion(_ rect: CGRect) -> CaptureResult? {
@@ -97,12 +101,7 @@ final class CaptureManager {
             height: rect.height
         ).integral
 
-        guard let cgImage = CGWindowListCreateImage(
-            quartzRect,
-            .optionOnScreenOnly,
-            kCGNullWindowID,
-            [.bestResolution, .boundsIgnoreFraming]
-        ) else { return nil }
+        guard let cgImage = captureExcludingOwnWindows(rect: quartzRect) else { return nil }
 
         let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
         guard let screenshot = save(cgImage: cgImage) else { return nil }
@@ -111,60 +110,54 @@ final class CaptureManager {
         return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen, isWindowCapture: isWindowCapture)
     }
 
+    /// Composites every on-screen window in the given Quartz-coordinate rect
+    /// EXCEPT windows owned by this process. This keeps SSClipboard's own UI —
+    /// the action-overlay card and preview, the scroll-recording HUD, the
+    /// region-selection panel — out of full-screen and region captures while
+    /// leaving it fully visible to the user on screen.
+    ///
+    /// `CGDisplayCreateImage` (raw framebuffer) and `NSWindow.sharingType` are
+    /// not reliable for this: the former ignores per-window sharing entirely,
+    /// the latter behaves inconsistently across macOS versions. Explicitly
+    /// excluding our own window IDs is deterministic.
+    private func captureExcludingOwnWindows(rect: CGRect) -> CGImage? {
+        let myPID = getpid()
+        guard let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
+            return nil
+        }
+
+        // CGWindowListCopyWindowInfo returns windows front-to-back, which is the
+        // order CGWindowListCreateImageFromArray composites them in.
+        var windowIDs: [CGWindowID] = []
+        windowIDs.reserveCapacity(infoList.count)
+        for info in infoList {
+            guard let id = info[kCGWindowNumber as String] as? CGWindowID else { continue }
+            if let ownerPID = info[kCGWindowOwnerPID as String] as? pid_t, ownerPID == myPID {
+                continue
+            }
+            windowIDs.append(id)
+        }
+
+        guard !windowIDs.isEmpty else { return nil }
+
+        // The CFArray must hold the raw CGWindowID values reinterpreted as
+        // pointers, not CFNumbers.
+        var pointers: [UnsafeRawPointer?] = windowIDs.map { UnsafeRawPointer(bitPattern: UInt($0)) }
+        guard let windowArray = CFArrayCreate(kCFAllocatorDefault, &pointers, pointers.count, nil) else {
+            return nil
+        }
+
+        return CGImage(
+            windowListFromArrayScreenBounds: rect,
+            windowArray: windowArray,
+            imageOption: [.bestResolution, .boundsIgnoreFraming]
+        )
+    }
+
     func saveScrollCapture(_ cgImage: CGImage) -> CaptureResult? {
         let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
         guard let screenshot = save(cgImage: cgImage) else { return nil }
         return CaptureResult(screenshot: screenshot, image: image, anchorScreen: NSScreen.main, isWindowCapture: false)
-    }
-
-    private func makeCompositeImage(for screens: [NSScreen], canvasRect: CGRect) -> CGImage? {
-        // NSScreen.frame is in points; CGDisplayCreateImage is native pixels (see captureRegion + bestResolution).
-        var width = 0
-        var height = 0
-        for screen in screens {
-            let scale = screen.backingScaleFactor
-            let frame = screen.frame
-            width = max(width, Int(((frame.maxX - canvasRect.minX) * scale).rounded(.up)))
-            height = max(height, Int(((frame.maxY - canvasRect.minY) * scale).rounded(.up)))
-        }
-
-        guard width > 0,
-              height > 0,
-              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(
-                data: nil,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: 0,
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              ) else {
-            return nil
-        }
-
-        context.setFillColor(NSColor.clear.cgColor)
-        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
-
-        for screen in screens {
-            guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
-                  let displayImage = CGDisplayCreateImage(displayID) else {
-                continue
-            }
-
-            let scale = screen.backingScaleFactor
-            let frame = screen.frame
-            let drawRect = CGRect(
-                x: (frame.minX - canvasRect.minX) * scale,
-                y: (frame.minY - canvasRect.minY) * scale,
-                width: CGFloat(displayImage.width),
-                height: CGFloat(displayImage.height)
-            )
-
-            context.draw(displayImage, in: drawRect)
-        }
-
-        return context.makeImage()
     }
 
     private func save(cgImage: CGImage) -> ScreenshotFile? {
