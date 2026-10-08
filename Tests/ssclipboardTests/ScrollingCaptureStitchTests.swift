@@ -71,6 +71,37 @@ func stitchReturnsSingleFrameWhenNothingScrolled() throws {
     #expect(stitched.height == frame.height)
 }
 
+// MARK: - Frame accumulator
+
+@Test
+func accumulatorStitchMatchesDirectStitch() throws {
+    let frames = try downwardScrollFrames(step: 5)
+    let accumulator = ScrollFrameAccumulator()
+    for frame in frames { accumulator.append(frame) }
+
+    let direct = try #require(ScrollingStitcher.stitch(frames: frames))
+    let accumulated = try #require(ScrollingStitcher.stitch(rowFrames: accumulator.frames))
+    #expect(accumulated.width == direct.width)
+    #expect(accumulated.height == direct.height)
+    #expect(sampleRowValues(of: accumulated) == sampleRowValues(of: direct))
+}
+
+@Test
+func accumulatorSharesRepeatedRowsAndSkipsPausedFrames() throws {
+    let frames = try downwardScrollFrames(step: 5)
+    let accumulator = ScrollFrameAccumulator()
+    for frame in frames { accumulator.append(frame) }
+    #expect(!accumulator.append(frames[frames.count - 1]), "a repeat of the last frame is a pause")
+    #expect(accumulator.frames.count == frames.count)
+
+    // Only the distinct rows (chrome + each document row) should be stored,
+    // not every row of every frame.
+    let rowBytes = imageWidth * MemoryLayout<UInt32>.stride
+    let totalRows = frames.count * (topRows + bandHeight + bottomRows)
+    #expect(accumulator.uniqueBytes <= (2 + documentLength) * rowBytes)
+    #expect(accumulator.uniqueBytes < totalRows * rowBytes / 2)
+}
+
 // MARK: - Original minimal overlap case
 
 @Test

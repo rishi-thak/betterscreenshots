@@ -4,22 +4,29 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-struct CaptureResult {
-    let screenshot: ScreenshotFile
-    let image: NSImage
+/// A grabbed image that hasn't been written to disk yet. Grabbing is fast and
+/// stays on the main thread; encoding and saving happen in `save(_:)`.
+struct CapturedImage {
+    let cgImage: CGImage
     let anchorScreen: NSScreen?
     let isWindowCapture: Bool
 }
 
+struct SavedCapture: Sendable {
+    let screenshot: ScreenshotFile
+    /// PNG bytes for the clipboard, when requested.
+    let clipboardPNG: Data?
+}
+
+@MainActor
 final class CaptureManager {
     private let configuration: ScreenshotConfiguration
-    private let fileManager = FileManager.default
 
     init(configuration: ScreenshotConfiguration) {
         self.configuration = configuration
     }
 
-    func captureFullScreen() -> CaptureResult? {
+    func captureFullScreen() -> CapturedImage? {
         // Capture only the display the cursor is currently on, rather than
         // compositing every screen. NSEvent.mouseLocation is in global AppKit
         // coordinates (bottom-left origin); NSScreen.frame uses the same space.
@@ -35,24 +42,16 @@ final class CaptureManager {
             return nil
         }
 
-        let image = NSImage(
-            cgImage: cgImage,
-            size: NSSize(width: cgImage.width, height: cgImage.height)
-        )
-        guard let screenshot = save(cgImage: cgImage) else {
-            return nil
-        }
-
-        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: screen, isWindowCapture: false)
+        return CapturedImage(cgImage: cgImage, anchorScreen: screen, isWindowCapture: false)
     }
 
-    func captureRegion(_ rect: CGRect) -> CaptureResult? {
+    func captureRegion(_ rect: CGRect) -> CapturedImage? {
         let normalizedRect = rect.standardized.integral
         guard normalizedRect.width >= 2, normalizedRect.height >= 2 else { return nil }
         return capture(rect: normalizedRect, anchorPoint: CGPoint(x: normalizedRect.midX, y: normalizedRect.midY), isWindowCapture: false)
     }
 
-    func captureWindow(windowID: CGWindowID, rect: CGRect) -> CaptureResult? {
+    func captureWindow(windowID: CGWindowID, rect: CGRect) -> CapturedImage? {
         guard let cgImage = CGWindowListCreateImage(
             CGRect.null,
             .optionIncludingWindow,
@@ -69,11 +68,8 @@ final class CaptureManager {
         } else {
             outputImage = cgImage
         }
-        let image = NSImage(cgImage: outputImage, size: NSSize(width: outputImage.width, height: outputImage.height))
-        guard let screenshot = save(cgImage: outputImage) else { return nil }
-
         let anchorScreen = NSScreen.screens.first(where: { $0.frame.contains(CGPoint(x: rect.midX, y: rect.midY)) })
-        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen, isWindowCapture: true)
+        return CapturedImage(cgImage: outputImage, anchorScreen: anchorScreen, isWindowCapture: true)
     }
 
     private func roundedMask(_ image: CGImage, radius: CGFloat) -> CGImage? {
@@ -89,7 +85,7 @@ final class CaptureManager {
         return ctx.makeImage()
     }
 
-    private func capture(rect: CGRect, anchorPoint: CGPoint, isWindowCapture: Bool) -> CaptureResult? {
+    private func capture(rect: CGRect, anchorPoint: CGPoint, isWindowCapture: Bool) -> CapturedImage? {
         // CGWindowListCreateImage uses Quartz coordinates (top-left origin, Y down).
         // The incoming rect is in AppKit screen coordinates (bottom-left origin, Y up).
         // Flip Y: quartzY = primaryScreenHeight - (appKitY + height)
@@ -103,11 +99,8 @@ final class CaptureManager {
 
         guard let cgImage = captureExcludingOwnWindows(rect: quartzRect) else { return nil }
 
-        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        guard let screenshot = save(cgImage: cgImage) else { return nil }
-
         let anchorScreen = NSScreen.screens.first(where: { $0.frame.contains(anchorPoint) })
-        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: anchorScreen, isWindowCapture: isWindowCapture)
+        return CapturedImage(cgImage: cgImage, anchorScreen: anchorScreen, isWindowCapture: isWindowCapture)
     }
 
     /// Composites every on-screen window in the given Quartz-coordinate rect
@@ -154,51 +147,86 @@ final class CaptureManager {
         )
     }
 
-    func saveScrollCapture(_ cgImage: CGImage) -> CaptureResult? {
-        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        guard let screenshot = save(cgImage: cgImage) else { return nil }
-        return CaptureResult(screenshot: screenshot, image: image, anchorScreen: NSScreen.main, isWindowCapture: false)
+    /// Encodes and writes the image off the main thread. When
+    /// `includeClipboardPNG` is set, also returns PNG bytes for the clipboard
+    /// (the file's own bytes when it is a PNG, so nothing is encoded twice).
+    func save(_ cgImage: CGImage, includeClipboardPNG: Bool) async -> SavedCapture? {
+        let configuration = configuration
+        // Name the file for when it was captured, not when encoding finished.
+        let capturedAt = Date()
+        return await Task.detached(priority: .userInitiated) {
+            Self.encodeAndWrite(
+                cgImage,
+                capturedAt: capturedAt,
+                configuration: configuration,
+                includeClipboardPNG: includeClipboardPNG
+            )
+        }.value
     }
 
-    private func save(cgImage: CGImage) -> ScreenshotFile? {
+    private nonisolated static func encodeAndWrite(
+        _ cgImage: CGImage,
+        capturedAt: Date,
+        configuration: ScreenshotConfiguration,
+        includeClipboardPNG: Bool
+    ) -> SavedCapture? {
+        let fileManager = FileManager.default
         do {
             try fileManager.createDirectory(at: configuration.directoryURL, withIntermediateDirectories: true)
         } catch {
             return nil
         }
 
-        let baseName = CaptureNaming.baseName(date: Date())
-        let fileExtension = configuration.outputExtension
-        guard let fileURL = reserveUniqueFileURL(baseName: baseName, fileExtension: fileExtension) else {
-            return nil
-        }
-
-        guard let destination = CGImageDestinationCreateWithURL(
-            fileURL as CFURL,
+        let image = ImageCompaction.compacted(cgImage)
+        let encoded = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            encoded,
             configuration.outputUTType.identifier as CFString,
             1,
             nil
         ) else {
             return nil
         }
-
         CGImageDestinationAddImage(
             destination,
-            ImageCompaction.compacted(cgImage),
-            Self.encodingProperties(for: configuration.outputUTType) as CFDictionary
+            image,
+            encodingProperties(for: configuration.outputUTType) as CFDictionary
         )
         guard CGImageDestinationFinalize(destination) else {
+            return nil
+        }
+
+        let baseName = CaptureNaming.baseName(date: capturedAt)
+        guard let fileURL = reserveUniqueFileURL(
+            baseName: baseName,
+            fileExtension: configuration.outputExtension,
+            directoryURL: configuration.directoryURL
+        ) else {
+            return nil
+        }
+        do {
+            try (encoded as Data).write(to: fileURL)
+        } catch {
             try? fileManager.removeItem(at: fileURL)
             return nil
         }
 
-        return ScreenshotFile(id: fileURL.path, url: fileURL, createdAt: Date())
+        var clipboardPNG: Data?
+        if includeClipboardPNG {
+            clipboardPNG = configuration.outputUTType == .png
+                ? encoded as Data
+                : ClipboardWriter.pngData(for: image)
+        }
+        return SavedCapture(
+            screenshot: ScreenshotFile(id: fileURL.path, url: fileURL, createdAt: capturedAt),
+            clipboardPNG: clipboardPNG
+        )
     }
 
     /// Lossy formats default to near-maximum quality in ImageIO, which bloats
     /// JPEG/HEIC screenshots for no visible gain; 0.85 matches what macOS's
     /// own screencapture produces.
-    static func encodingProperties(for type: UTType) -> [CFString: Any] {
+    nonisolated static func encodingProperties(for type: UTType) -> [CFString: Any] {
         switch type {
         case .jpeg, .heic:
             return [kCGImageDestinationLossyCompressionQuality: 0.85]
@@ -210,13 +238,18 @@ final class CaptureManager {
     /// Atomically claims a unique filename via O_CREAT|O_EXCL instead of only
     /// check-then-write, which would leave a window for a concurrent capture
     /// to land on the same name and get silently overwritten.
-    private func reserveUniqueFileURL(baseName: String, fileExtension: String, maxAttempts: Int = 50) -> URL? {
+    private nonisolated static func reserveUniqueFileURL(
+        baseName: String,
+        fileExtension: String,
+        directoryURL: URL,
+        maxAttempts: Int = 50
+    ) -> URL? {
         for _ in 0..<maxAttempts {
             let candidate = CaptureNaming.uniqueFileURL(
                 baseName: baseName,
                 fileExtension: fileExtension,
-                directoryURL: configuration.directoryURL,
-                fileExists: fileManager.fileExists(atPath:)
+                directoryURL: directoryURL,
+                fileExists: FileManager.default.fileExists(atPath:)
             )
             let fd = open(candidate.path, O_CREAT | O_EXCL | O_WRONLY, 0o644)
             if fd >= 0 {

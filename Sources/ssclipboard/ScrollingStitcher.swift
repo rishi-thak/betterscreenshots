@@ -28,31 +28,38 @@ enum ScrollingStitcher {
     private static let maxRowComparisons = 400
 
     static func stitch(frames images: [CGImage]) -> CGImage? {
-        guard let firstImage = images.first else { return nil }
-        guard images.count > 1 else { return firstImage }
+        stitch(rowFrames: images.map(rows(of:)))
+    }
+
+    /// Stitches frames already decoded into visual rows (top to bottom), as
+    /// produced by `rows(of:)`. Rows may share storage across frames (see
+    /// `ScrollFrameAccumulator`); they are only read, never mutated.
+    static func stitch(rowFrames: [[[UInt32]]]) -> CGImage? {
+        let decoded = rowFrames.filter { !$0.isEmpty && !($0.first?.isEmpty ?? true) }
+        guard let firstFrame = decoded.first else { return nil }
+        guard decoded.count > 1 else { return makeImage(visualRows: firstFrame, width: firstFrame[0].count) }
 
         // Normalize to the modal dimensions; drop frames that don't match (e.g.
         // a window resize mid-capture).
-        let width = modalValue(images.map(\.width)) ?? firstImage.width
-        let height = modalValue(images.filter { $0.width == width }.map(\.height)) ?? firstImage.height
-        let frames = images.filter { $0.width == width && $0.height == height }
-        guard frames.count > 1 else { return frames.first ?? firstImage }
-
-        let rowsPerFrame = frames.map { allRows(of: $0) }
-        guard rowsPerFrame.allSatisfy({ $0.count == height && ($0.first?.count ?? 0) == width }) else {
-            return frames.first
-        }
+        let width = modalValue(decoded.map { $0[0].count }) ?? firstFrame[0].count
+        let height = modalValue(decoded.filter { $0[0].count == width }.map(\.count)) ?? firstFrame.count
+        let rowsPerFrame = decoded.filter { $0.count == height && $0.allSatisfy { $0.count == width } }
+        guard let first = rowsPerFrame.first else { return makeImage(visualRows: firstFrame, width: firstFrame[0].count) }
+        guard rowsPerFrame.count > 1 else { return makeImage(visualRows: first, width: width) }
+        func unchanged() -> CGImage? { makeImage(visualRows: first, width: width) }
 
         let columnStride = max(1, width / columnSamples)
+        // Every comparison below only looks at sampled columns, so extract
+        // those once per frame into compact signatures instead of striding
+        // through full-width rows millions of times.
+        let signatures = rowsPerFrame.map { RowSignatures(rows: $0, columnStride: columnStride) }
 
         // 1. Detect the non-scrolling top and bottom chrome bands.
-        let (contentTop, contentBottom) = contentBand(
-            rowsPerFrame: rowsPerFrame, height: height, columnStride: columnStride
-        )
+        let (contentTop, contentBottom) = contentBand(signatures: signatures, height: height)
         let bandHeight = contentBottom - contentTop
         guard bandHeight > 8 else {
             // Nothing actually scrolled (or band too small) — nothing to stitch.
-            return frames.first
+            return unchanged()
         }
 
         let rowStride = max(1, bandHeight / maxRowComparisons)
@@ -60,15 +67,14 @@ enum ScrollingStitcher {
 
         // 2. Compute each frame's absolute vertical offset relative to frame 0.
         //    Positive delta == content scrolled up (the common downward read).
-        var offsets = [Int](repeating: 0, count: frames.count)
+        var offsets = [Int](repeating: 0, count: rowsPerFrame.count)
         var anchor = 0  // last frame we successfully aligned against
-        for index in 1 ..< frames.count {
+        for index in 1 ..< rowsPerFrame.count {
             let delta = bandDisplacement(
-                prev: rowsPerFrame[anchor],
-                curr: rowsPerFrame[index],
+                prev: signatures[anchor],
+                curr: signatures[index],
                 top: contentTop,
                 bottom: contentBottom,
-                columnStride: columnStride,
                 rowStride: rowStride,
                 minOverlap: minOverlap
             )
@@ -94,7 +100,7 @@ enum ScrollingStitcher {
         let topChrome = contentTop
         let bottomChrome = height - contentBottom
         let totalHeight = topChrome + contentHeight + bottomChrome
-        guard totalHeight > height else { return frames.first }
+        guard totalHeight > height else { return unchanged() }
 
         var output = [[UInt32]](repeating: [], count: totalHeight)
 
@@ -104,7 +110,7 @@ enum ScrollingStitcher {
         }
         // Bottom chrome from the last frame.
         for offset in 0 ..< bottomChrome {
-            output[totalHeight - bottomChrome + offset] = rowsPerFrame[frames.count - 1][contentBottom + offset]
+            output[totalHeight - bottomChrome + offset] = rowsPerFrame[rowsPerFrame.count - 1][contentBottom + offset]
         }
         // Content band, written in capture order so the freshest pixels win in
         // overlapping regions.
@@ -129,10 +135,13 @@ enum ScrollingStitcher {
     /// frames recorded while the user has paused scrolling.
     static func framesAreDuplicate(_ lhs: CGImage, _ rhs: CGImage) -> Bool {
         guard lhs.width == rhs.width, lhs.height == rhs.height else { return false }
-        let lhsRows = allRows(of: lhs)
-        let rhsRows = allRows(of: rhs)
-        guard lhsRows.count == rhsRows.count, lhsRows.count > 0 else { return false }
-        let columnStride = max(1, lhs.width / columnSamples)
+        return rowsAreDuplicate(rows(of: lhs), rows(of: rhs))
+    }
+
+    static func rowsAreDuplicate(_ lhsRows: [[UInt32]], _ rhsRows: [[UInt32]]) -> Bool {
+        guard lhsRows.count == rhsRows.count, let width = lhsRows.first?.count, width > 0,
+              rhsRows.first?.count == width else { return false }
+        let columnStride = max(1, width / columnSamples)
         let rowStride = max(1, lhsRows.count / 120)
         var row = 0
         while row < lhsRows.count {
@@ -146,16 +155,12 @@ enum ScrollingStitcher {
 
     // MARK: - Band detection
 
-    private static func contentBand(
-        rowsPerFrame: [[[UInt32]]], height: Int, columnStride: Int
-    ) -> (top: Int, bottom: Int) {
-        guard rowsPerFrame.count > 1 else { return (0, height) }
+    private static func contentBand(signatures: [RowSignatures], height: Int) -> (top: Int, bottom: Int) {
+        guard signatures.count > 1 else { return (0, height) }
 
         func rowIsStaticAcrossAllFrames(_ row: Int) -> Bool {
-            for index in 1 ..< rowsPerFrame.count {
-                let diff = averageChannelDiff(
-                    rowsPerFrame[index - 1][row], rowsPerFrame[index][row], columnStride: columnStride
-                )
+            for index in 1 ..< signatures.count {
+                let diff = RowSignatures.averageChannelDiff(signatures[index - 1], row, signatures[index], row)
                 if diff > staticTolerance { return false }
             }
             return true
@@ -175,11 +180,10 @@ enum ScrollingStitcher {
     /// positive value when content scrolled up (read downward), negative when
     /// content scrolled down (read upward).
     private static func bandDisplacement(
-        prev: [[UInt32]],
-        curr: [[UInt32]],
+        prev: RowSignatures,
+        curr: RowSignatures,
         top: Int,
         bottom: Int,
-        columnStride: Int,
         rowStride: Int,
         minOverlap: Int
     ) -> Int? {
@@ -201,9 +205,7 @@ enum ScrollingStitcher {
             var samples = 0
             var q = qStart
             while q < qEnd {
-                total += averageChannelDiff(
-                    curr[top + q], prev[top + q + delta], columnStride: columnStride
-                )
+                total += RowSignatures.averageChannelDiff(curr, top + q, prev, top + q + delta)
                 samples += 1
                 q += rowStride
             }
@@ -252,7 +254,7 @@ enum ScrollingStitcher {
         }?.key
     }
 
-    private static func allRows(of image: CGImage) -> [[UInt32]] {
+    static func rows(of image: CGImage) -> [[UInt32]] {
         let width = image.width
         let height = image.height
         guard width > 0, height > 0,
@@ -306,5 +308,66 @@ enum ScrollingStitcher {
             }
         }
         return context.makeImage()
+    }
+}
+
+/// The sampled columns of every row in a frame, stored contiguously as RGB
+/// bytes. Produces exactly the same comparisons as striding through the full
+/// rows with `averageChannelDiff`, at a fraction of the cost: rows are padded
+/// with zeros to a multiple of 16 bytes so differences are summed with SIMD
+/// (padding contributes nothing to the sum).
+private struct RowSignatures {
+    private typealias Chunk = SIMD16<UInt8>
+    private let bytesPerRow: Int  // meaningful bytes (samples * 3)
+    private let paddedBytesPerRow: Int
+    private let bytes: [UInt8]
+
+    init(rows: [[UInt32]], columnStride: Int) {
+        let width = rows.first?.count ?? 0
+        let samplesPerRow = width == 0 ? 0 : (width + columnStride - 1) / columnStride
+        let bytesPerRow = samplesPerRow * 3
+        let paddedBytesPerRow = (bytesPerRow + Chunk.scalarCount - 1) / Chunk.scalarCount * Chunk.scalarCount
+        var bytes = [UInt8](repeating: 0, count: rows.count * paddedBytesPerRow)
+        bytes.withUnsafeMutableBufferPointer { out in
+            for (rowIndex, row) in rows.enumerated() {
+                var cursor = rowIndex * paddedBytesPerRow
+                var index = 0
+                while index < width {
+                    let pixel = row[index]
+                    out[cursor] = UInt8(pixel & 0xFF)
+                    out[cursor + 1] = UInt8((pixel >> 8) & 0xFF)
+                    out[cursor + 2] = UInt8((pixel >> 16) & 0xFF)
+                    cursor += 3
+                    index += columnStride
+                }
+            }
+        }
+        self.bytesPerRow = bytesPerRow
+        self.paddedBytesPerRow = paddedBytesPerRow
+        self.bytes = bytes
+    }
+
+    static func averageChannelDiff(_ lhs: RowSignatures, _ lhsRow: Int, _ rhs: RowSignatures, _ rhsRow: Int) -> Double {
+        let count = min(lhs.bytesPerRow, rhs.bytesPerRow)
+        guard count > 0 else { return 0 }
+        precondition(lhs.paddedBytesPerRow == rhs.paddedBytesPerRow)
+        let total = lhs.bytes.withUnsafeBytes { a in
+            rhs.bytes.withUnsafeBytes { b in
+                let aBase = lhsRow * lhs.paddedBytesPerRow
+                let bBase = rhsRow * rhs.paddedBytesPerRow
+                // Per-lane max is 255 * chunks, far below UInt16.max for the
+                // <= 65 sampled columns per row.
+                var sums = SIMD16<UInt16>()
+                var offset = 0
+                while offset < lhs.paddedBytesPerRow {
+                    let x = a.loadUnaligned(fromByteOffset: aBase + offset, as: Chunk.self)
+                    let y = b.loadUnaligned(fromByteOffset: bBase + offset, as: Chunk.self)
+                    sums &+= SIMD16<UInt16>(truncatingIfNeeded: pointwiseMax(x, y) &- pointwiseMin(x, y))
+                    offset += Chunk.scalarCount
+                }
+                return Int(SIMD16<UInt32>(truncatingIfNeeded: sums).wrappedSum())
+            }
+        }
+        return Double(total) / Double(count)
     }
 }

@@ -116,18 +116,18 @@ final class ScreenshotAgent {
                     guard let self else { return }
                     self.hotKeyManager.keyInterceptor = nil
                     self.hideScrollRecordingHUD()
-                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                    guard let saved = self.captureManager.saveScrollCapture(cgImage) else { return }
-                    if self.appSettings.copyToClipboardEnabled {
-                        _ = self.clipboardWriter.copyImage(at: saved.screenshot.url)
+                    guard let cgImage else {
+                        SSCLog.scroll.error("scroll capture produced no image")
+                        NSSound.beep()
+                        return
                     }
-                    self.overlayController.present(for: saved.screenshot, previewImage: nsImage, on: NSScreen.main, isWindowCapture: false)
+                    self.handleCapture(CapturedImage(cgImage: cgImage, anchorScreen: NSScreen.main, isWindowCapture: false))
                 }
                 self.scrollingCaptureController.begin(windowID: windowID)
                 return
             }
 
-            let captureResult: CaptureResult?
+            let captureResult: CapturedImage?
             if let windowID = result.windowID {
                 captureResult = self.captureManager.captureWindow(windowID: windowID, rect: result.rect)
             } else {
@@ -145,11 +145,31 @@ final class ScreenshotAgent {
         hotKeyManager.keyInterceptor = regionSelectionController.keyInterceptor
     }
 
-    private func handleCapture(_ result: CaptureResult) {
-        if appSettings.copyToClipboardEnabled {
-            _ = clipboardWriter.copyImage(at: result.screenshot.url)
+    /// Encodes and saves in the background, then updates the clipboard and
+    /// shows the overlay back on the main actor.
+    private func handleCapture(_ captured: CapturedImage) {
+        let copyToClipboard = appSettings.copyToClipboardEnabled
+        Task { [weak self] in
+            guard let self else { return }
+            guard let saved = await self.captureManager.save(captured.cgImage, includeClipboardPNG: copyToClipboard) else {
+                SSCLog.capture.error("saving capture failed")
+                NSSound.beep()
+                return
+            }
+            if let png = saved.clipboardPNG {
+                _ = self.clipboardWriter.copyPNGData(png)
+            }
+            let preview = NSImage(
+                cgImage: captured.cgImage,
+                size: NSSize(width: captured.cgImage.width, height: captured.cgImage.height)
+            )
+            self.overlayController.present(
+                for: saved.screenshot,
+                previewImage: preview,
+                on: captured.anchorScreen,
+                isWindowCapture: captured.isWindowCapture
+            )
         }
-        overlayController.present(for: result.screenshot, previewImage: result.image, on: result.anchorScreen, isWindowCapture: result.isWindowCapture)
     }
 
     private var scrollHUD: NSPanel?

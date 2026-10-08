@@ -28,8 +28,20 @@ final class HotKeyManager: @unchecked Sendable {
     private let tapLock = NSLock()
 
     // Optional interceptor set by RegionSelectionController while overlay is active.
-    // Must be thread-safe: written on main, read on tap thread.
-    var keyInterceptor: (@Sendable (CGEvent) -> Bool)?
+    // Written on main, read on the tap thread, so access goes through tapLock.
+    private var _keyInterceptor: (@Sendable (CGEvent) -> Bool)?
+    var keyInterceptor: (@Sendable (CGEvent) -> Bool)? {
+        get {
+            tapLock.lock()
+            defer { tapLock.unlock() }
+            return _keyInterceptor
+        }
+        set {
+            tapLock.lock()
+            _keyInterceptor = newValue
+            tapLock.unlock()
+        }
+    }
 
     init(onFullScreen: @escaping @Sendable () -> Void,
          onRegion: @escaping @Sendable () -> Void) {

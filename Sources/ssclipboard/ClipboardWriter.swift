@@ -10,24 +10,16 @@ import UniformTypeIdentifiers
 /// capture), and that TIFF is what most apps receive on paste. Publishing
 /// `public.png` instead keeps pastes the same size as the file on disk.
 final class ClipboardWriter {
-    /// Copies an already-encoded screenshot file. PNG files are put on the
-    /// pasteboard byte-for-byte (no re-encode); other formats are re-encoded
-    /// to PNG since many apps don't accept HEIC/JPEG pastes.
-    func copyImage(at url: URL) -> Bool {
-        if UTType(filenameExtension: url.pathExtension) == .png,
-           let data = try? Data(contentsOf: url) {
-            return write(pngData: data)
-        }
-        guard let image = NSImage(contentsOf: url) else { return false }
-        return copyImage(image)
-    }
-
     func copyImage(_ image: NSImage) -> Bool {
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
               let data = Self.pngData(for: cgImage) else {
             return false
         }
         return write(pngData: data)
+    }
+
+    func copyPNGData(_ data: Data) -> Bool {
+        write(pngData: data)
     }
 
     private func write(pngData: Data) -> Bool {
