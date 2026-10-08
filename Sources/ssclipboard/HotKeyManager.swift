@@ -7,6 +7,13 @@ import Foundation
 /// The tap callback runs on the thread that drives the run loop it is attached to.
 /// We attach it to a **dedicated background run loop** so it never touches the main
 /// thread at all — no deadlock possible even if the main thread is busy.
+///
+/// Privacy scope: a session-wide key tap is the only way macOS lets a regular
+/// (non-Apple) process observe global keyboard shortcuts, so this callback sees
+/// every keyDown/keyUp in the session, not just the two shortcuts it acts on.
+/// `handle(event:type:)` must never log, store, or transmit `keyCode`/`flags`
+/// for keys other than the ones it explicitly matches below — doing so would
+/// turn this into a de facto keylogger.
 final class HotKeyManager: @unchecked Sendable {
     private let onFullScreen: @Sendable () -> Void
     private let onRegion: @Sendable () -> Void

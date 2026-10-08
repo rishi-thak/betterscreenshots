@@ -1,14 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict>
-    <!-- Required for CGEvent tap (global hotkeys) -->
-    <key>com.apple.security.temporary-exception.accessibility</key>
-    <true/>
-    <!-- Required for screen capture -->
-    <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
-    <array>
-        <string>com.apple.screencaptureui</string>
-    </array>
-</dict>
+<!--
+  This app does not enable com.apple.security.app-sandbox, so it runs
+  unsandboxed and the App Sandbox temporary-exception entitlements that used
+  to live here (accessibility, mach-lookup) had no effect — those keys are
+  only meaningful inside the sandbox. Global hotkeys and screen capture are
+  gated purely by TCC (Accessibility / Screen Recording user consent), not by
+  entitlements. Kept empty rather than removed so the hardened-runtime
+  codesign step in scripts/build_app.sh continues to have an entitlements
+  file to sign against.
+-->
+<dict/>
 </plist>

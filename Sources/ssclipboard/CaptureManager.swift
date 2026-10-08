@@ -169,12 +169,9 @@ final class CaptureManager {
 
         let baseName = CaptureNaming.baseName(date: Date())
         let fileExtension = configuration.outputExtension
-        let fileURL = CaptureNaming.uniqueFileURL(
-            baseName: baseName,
-            fileExtension: fileExtension,
-            directoryURL: configuration.directoryURL,
-            fileExists: fileManager.fileExists(atPath:)
-        )
+        guard let fileURL = reserveUniqueFileURL(baseName: baseName, fileExtension: fileExtension) else {
+            return nil
+        }
 
         guard let destination = CGImageDestinationCreateWithURL(
             fileURL as CFURL,
@@ -185,11 +182,49 @@ final class CaptureManager {
             return nil
         }
 
-        CGImageDestinationAddImage(destination, cgImage, nil)
+        CGImageDestinationAddImage(
+            destination,
+            ImageCompaction.compacted(cgImage),
+            Self.encodingProperties(for: configuration.outputUTType) as CFDictionary
+        )
         guard CGImageDestinationFinalize(destination) else {
+            try? fileManager.removeItem(at: fileURL)
             return nil
         }
 
         return ScreenshotFile(id: fileURL.path, url: fileURL, createdAt: Date())
+    }
+
+    /// Lossy formats default to near-maximum quality in ImageIO, which bloats
+    /// JPEG/HEIC screenshots for no visible gain; 0.85 matches what macOS's
+    /// own screencapture produces.
+    static func encodingProperties(for type: UTType) -> [CFString: Any] {
+        switch type {
+        case .jpeg, .heic:
+            return [kCGImageDestinationLossyCompressionQuality: 0.85]
+        default:
+            return [:]
+        }
+    }
+
+    /// Atomically claims a unique filename via O_CREAT|O_EXCL instead of only
+    /// check-then-write, which would leave a window for a concurrent capture
+    /// to land on the same name and get silently overwritten.
+    private func reserveUniqueFileURL(baseName: String, fileExtension: String, maxAttempts: Int = 50) -> URL? {
+        for _ in 0..<maxAttempts {
+            let candidate = CaptureNaming.uniqueFileURL(
+                baseName: baseName,
+                fileExtension: fileExtension,
+                directoryURL: configuration.directoryURL,
+                fileExists: fileManager.fileExists(atPath:)
+            )
+            let fd = open(candidate.path, O_CREAT | O_EXCL | O_WRONLY, 0o644)
+            if fd >= 0 {
+                close(fd)
+                return candidate
+            }
+            guard errno == EEXIST else { return nil }
+        }
+        return nil
     }
 }

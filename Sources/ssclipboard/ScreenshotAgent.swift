@@ -119,7 +119,7 @@ final class ScreenshotAgent {
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     guard let saved = self.captureManager.saveScrollCapture(cgImage) else { return }
                     if self.appSettings.copyToClipboardEnabled {
-                        _ = self.clipboardWriter.copyImage(nsImage)
+                        _ = self.clipboardWriter.copyImage(at: saved.screenshot.url)
                     }
                     self.overlayController.present(for: saved.screenshot, previewImage: nsImage, on: NSScreen.main, isWindowCapture: false)
                 }
@@ -147,7 +147,7 @@ final class ScreenshotAgent {
 
     private func handleCapture(_ result: CaptureResult) {
         if appSettings.copyToClipboardEnabled {
-            _ = clipboardWriter.copyImage(result.image)
+            _ = clipboardWriter.copyImage(at: result.screenshot.url)
         }
         overlayController.present(for: result.screenshot, previewImage: result.image, on: result.anchorScreen, isWindowCapture: result.isWindowCapture)
     }

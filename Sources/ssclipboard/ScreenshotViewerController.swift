@@ -493,13 +493,30 @@ final class ScreenshotViewerController: NSObject {
 
     private func persistEditedImage(_ image: NSImage) throws {
         guard let screenshot = currentScreenshot else { return }
-        guard let tiff = image.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiff),
-              let png = bitmap.representation(using: .png, properties: [:]) else {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             throw CocoaError(.fileWriteUnknown)
         }
 
-        try png.write(to: screenshot.url)
+        // Re-encode using whatever format the file's own extension implies,
+        // rather than always writing PNG bytes under the original extension.
+        let utType = UTType(filenameExtension: screenshot.url.pathExtension) ?? .png
+        guard let destination = CGImageDestinationCreateWithURL(
+            screenshot.url as CFURL,
+            utType.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        CGImageDestinationAddImage(
+            destination,
+            ImageCompaction.compacted(cgImage),
+            CaptureManager.encodingProperties(for: utType) as CFDictionary
+        )
+        guard CGImageDestinationFinalize(destination) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
         currentImage = image
         imageView.image = image
         _ = clipboardWriter.copyImage(image)
@@ -853,7 +870,10 @@ private final class RedactionControlsView: NSVisualEffectView {
     var onApply: ((RedactionStyle) -> Void)?
     var onCancel: (() -> Void)?
 
-    private let styleSelector = NSSegmentedControl(labels: ["Blur", "Black"], trackingMode: .selectOne, target: nil, action: nil)
+    // Black is listed and selected first: it destroys the underlying pixels,
+    // while blur is reversible via deconvolution/deblurring and should be an
+    // explicit opt-in rather than the default.
+    private let styleSelector = NSSegmentedControl(labels: ["Black", "Blur"], trackingMode: .selectOne, target: nil, action: nil)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -933,7 +953,7 @@ private final class RedactionControlsView: NSVisualEffectView {
     }
 
     private var selectedStyle: RedactionStyle {
-        styleSelector.selectedSegment == 0 ? .blur : .solidBlack
+        styleSelector.selectedSegment == 0 ? .solidBlack : .blur
     }
 
     @objc private func applyPressed() {
