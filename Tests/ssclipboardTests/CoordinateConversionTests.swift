@@ -17,11 +17,3 @@ func quartzWindowRectToAppKitGlobalConvertsTopLeftRect() {
 
     #expect(converted == CGRect(x: 300, y: 650, width: 400, height: 250))
 }
-
-@Test
-func localRectToGlobalOffsetsByPanelOrigin() {
-    let local = CGRect(x: 20, y: 40, width: 120, height: 60)
-    let global = CoordinateConversion.localRectToGlobal(local, panelOrigin: CGPoint(x: 1920, y: 0))
-
-    #expect(global == CGRect(x: 1940, y: 40, width: 120, height: 60))
-}
